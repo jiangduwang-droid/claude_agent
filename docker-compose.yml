@@ -1,0 +1,105 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: cca-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cca}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cca_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-cca_db}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cca}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  opensandbox-server:
+    image: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/server:latest
+    container_name: cca-opensandbox
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - opensandbox-data:/data
+    configs:
+      - source: opensandbox-config
+        target: /etc/opensandbox/config.toml
+    environment:
+      - SANDBOX_CONFIG_PATH=/etc/opensandbox/config.toml
+      - OPENSANDBOX_INSECURE_SERVER=YES
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cca-backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensandbox-server:
+        condition: service_started
+    volumes:
+      - ./skills:/app/skills
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cca}:${POSTGRES_PASSWORD:-cca_secret}@postgres:5432/${POSTGRES_DB:-cca_db}
+      SANDBOX_DOMAIN: "opensandbox-server:8080"
+      SANDBOX_API_KEY: "${SANDBOX_API_KEY:-opensandbox-secret}"
+      SANDBOX_IMAGE: "${SANDBOX_IMAGE:-python:3.12-slim}"
+      JWT_SECRET: ${JWT_SECRET:-}
+      API_KEY: ${API_KEY:-}
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cca-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_URL: /api/v1
+      API_BACKEND_URL: http://backend:8000/api/v1
+    restart: unless-stopped
+
+configs:
+  opensandbox-config:
+    content: |
+      [server]
+      host = "0.0.0.0"
+      port = 8080
+      api_key = "${SANDBOX_API_KEY:-opensandbox-secret}"
+
+      [log]
+      level = "INFO"
+
+      [runtime]
+      type = "docker"
+      execd_image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.0.22"
+
+      [docker]
+      network_mode = "cloud-claude-agent_default"
+      port_range_min = 40000
+      port_range_max = 60000
+      drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
+      no_new_privileges = true
+      pids_limit = 4096
+
+      [ingress]
+      mode = "direct"
+
+      [store]
+      type = "sqlite"
+      path = "/data/opensandbox.db"
+
+volumes:
+  pgdata:
+  opensandbox-data:
