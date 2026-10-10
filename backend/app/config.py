@@ -49,6 +49,7 @@ DEFAULT_CONFIG: dict = {
     "llm": {
         "provider": "anthropic",
         "model": "claude-sonnet-4-20250514",
+        "base_url": "",
         "temperature": 0.0,
         "max_tokens": 8192,
         "api_keys": {
@@ -219,6 +220,10 @@ class Config:
     @property
     def llm_model(self) -> str:
         return self._data["llm"]["model"]
+
+    @property
+    def llm_base_url(self) -> str:
+        return self._data["llm"].get("base_url", "")
 
     @property
     def llm_temperature(self) -> float:

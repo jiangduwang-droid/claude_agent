@@ -62,6 +62,7 @@ def _get_llm(config: Config):
     provider = config.llm_provider
     model = config.llm_model
     api_key = config.get_api_key(provider)
+    base_url = config.llm_base_url
     temperature = config.llm_temperature
     max_tokens = config.llm_max_tokens
 
@@ -80,6 +81,7 @@ def _get_llm(config: Config):
             api_key=api_key,
             temperature=temperature,
             max_tokens=max_tokens,
+            base_url=base_url or None,
         )
     elif provider in ("dashscope", "zhipu", "minimax"):
         from langchain_openai import ChatOpenAI
@@ -93,11 +95,14 @@ def _get_llm(config: Config):
             api_key=api_key,
             temperature=temperature,
             max_tokens=max_tokens,
-            base_url=base_urls.get(provider),
+            base_url=base_url or base_urls.get(provider),
         )
     else:
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model=model, api_key=api_key, temperature=temperature, max_tokens=max_tokens)
+        return ChatOpenAI(
+            model=model, api_key=api_key, temperature=temperature,
+            max_tokens=max_tokens, base_url=base_url or None,
+        )
 
 
 @retry(
