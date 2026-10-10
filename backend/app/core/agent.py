@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -170,14 +170,12 @@ def _make_sandbox_tool(tool_name: str, func: Any, tool_timeout: int = 60) -> Bas
             if not check.allowed:
                 return f"__PERMISSION_DENIED__:{check.reason}"
 
-        async def _sync_body(**kw):
-            if adapter is None:
-                return "Error: No sandbox adapter available"
-            return await adapter.call(tool_name, **kw)
+        if adapter is None:
+            return "Error: No sandbox adapter available"
 
         try:
             result = await asyncio.wait_for(
-                asyncio.to_thread(_sync_body, **kwargs),
+                adapter.call(tool_name, **kwargs),
                 timeout=tool_timeout,
             )
             return str(result)
@@ -374,6 +372,8 @@ async def stream_agent_response(
     step_tracker = StepTracker(max_steps=max_steps, doom_loop_threshold=doom_loop_threshold)
     cumulative_usage = {"prompt_tokens": 0, "completion_tokens":  0, "total_tokens": 0}
     last_prompt_tokens = 0
+    text_parts: list[str] = []
+    all_tool_calls: list = []
 
     while step < max_steps:
         if abort_event and abort_event.is_set():
@@ -397,6 +397,8 @@ async def stream_agent_response(
                     return
 
                 if chunk.content:
+                    if isinstance(chunk.content, str):
+                        text_parts.append(chunk.content)
                     if on_text_delta:
                         yield await on_text_delta(chunk.content)
 
@@ -447,6 +449,9 @@ async def stream_agent_response(
         messages.append(full_response)
 
         tool_calls = getattr(full_response, "tool_calls", None)
+        if tool_calls:
+            all_tool_calls.extend(tool_calls)
+
         if not tool_calls:
             yield {
                 "type": "done",
@@ -454,17 +459,25 @@ async def stream_agent_response(
                 "cumulative_usage": cumulative_usage,
                 "context_tokens": last_prompt_tokens,
                 "compression_pending": last_prompt_tokens > 128000 * 0.7,
+                "full_text": "".join(text_parts),
+                "tool_calls": all_tool_calls,
             }
             return
 
         filtered_tool_calls = []
+        dropped_tool_messages: list[ToolMessage] = []
         for tc in tool_calls:
             tool_name = tc.get("name", "")
             args = tc.get("args", {})
+            tool_call_id = tc.get("id", "")
 
             if step_tracker.check_doom_loop(tool_name, args):
                 if on_doom_loop:
                     yield await on_doom_loop(tool_name)
+                dropped_tool_messages.append(ToolMessage(
+                    content=f"Skipped: repeated identical call to '{tool_name}' (doom loop detected).",
+                    tool_call_id=tool_call_id,
+                ))
                 continue
 
             if permission_manager:
@@ -472,7 +485,17 @@ async def stream_agent_response(
                 if permission_manager.needs_confirmation(tool_name, conv_id):
                     if on_confirm_request:
                         yield await on_confirm_request(tc)
-                    continue
+                    approved = False
+                    if tool_call_id:
+                        approved = await permission_manager.wait_for_confirmation(
+                            tool_call_id, timeout=config.agent_confirm_timeout
+                        )
+                    if not approved:
+                        dropped_tool_messages.append(ToolMessage(
+                            content=f"User denied execution of tool '{tool_name}'.",
+                            tool_call_id=tool_call_id,
+                        ))
+                        continue
 
             filtered_tool_calls.append(tc)
 
@@ -483,17 +506,20 @@ async def stream_agent_response(
                 "cumulative_usage": cumulative_usage,
                 "context_tokens": last_prompt_tokens,
                 "compression_pending": False,
+                "full_text": "".join(text_parts),
+                "tool_calls": all_tool_calls,
             }
             return
 
         if tool_node:
-            from langchain_core.messages import ToolMessage
             results = await tool_node.ainvoke(filtered_tool_calls)
             tool_messages = results if isinstance(results, list) else [results]
             for tm in tool_messages:
                 messages.append(tm)
                 if on_tool_result:
                     yield await on_tool_result(tm)
+        for tm in dropped_tool_messages:
+            messages.append(tm)
 
     yield {
         "type": "step_limit_reached",

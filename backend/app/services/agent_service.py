@@ -283,7 +283,6 @@ class AgentService:
 
             messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
             messages.extend(history)
-            messages.append(HumanMessage(content=content))
 
             full_response_text = ""
             all_tool_calls: list = []
@@ -335,6 +334,7 @@ class AgentService:
                             compression_pending=event.get("compression_pending", False),
                         )
                         full_response_text = event.get("full_text", "")
+                        all_tool_calls = event.get("tool_calls", [])
                     elif event.get("type") == "aborted":
                         yield _sse_event("aborted")
                     elif event.get("type") == "step_limit_reached":
@@ -342,7 +342,7 @@ class AgentService:
                     elif "type" in event:
                         yield _sse_event(event["type"], **{k: v for k, v in event.items() if k != "type"})
 
-                elif isinstance(event, str) and event.startswith("data: "):
+                elif isinstance(event, str):
                     yield event
 
                 if abort_event.is_set():

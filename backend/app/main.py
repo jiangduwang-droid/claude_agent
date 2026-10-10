@@ -129,21 +129,21 @@ async def _send_429(send):
 async def _parallel_warmup(config: Config):
     tasks = []
 
-    async def _warmup_embedding():
+    def _warmup_embedding():
         try:
             from sentence_transformers import SentenceTransformer
             SentenceTransformer(config.rag_config["embedding_model"])
         except Exception:
             pass
 
-    async def _warmup_reranker():
+    def _warmup_reranker():
         try:
             from sentence_transformers import CrossEncoder
             CrossEncoder(config.rag_config["rerank_model"])
         except Exception:
             pass
 
-    async def _warmup_headroom():
+    def _warmup_headroom():
         try:
             HeadroomService.get_instance()
         except Exception:
@@ -157,8 +157,8 @@ async def _parallel_warmup(config: Config):
             pass
 
     tasks.append(asyncio.to_thread(_warmup_embedding))
-    tasks.append(_warmup_reranker())
-    tasks.append(_warmup_headroom())
+    tasks.append(asyncio.to_thread(_warmup_reranker))
+    tasks.append(asyncio.to_thread(_warmup_headroom))
     tasks.append(asyncio.to_thread(_warmup_jieba))
 
     await asyncio.gather(*tasks, return_exceptions=True)

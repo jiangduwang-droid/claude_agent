@@ -1,8 +1,8 @@
+import asyncio
 import copy
 import json
 import threading
 from pathlib import Path
-from typing import Any
 
 
 READ_PROFILE = {
@@ -42,6 +42,7 @@ class PermissionManager:
         self._default_profile = config.default_permission_profile if config else "write"
         self._overrides: dict[str, str] = {}
         self._confirmations: dict[str, asyncio.Event] = {}
+        self._decisions: dict[str, bool] = {}
         self._lock = threading.Lock()
         self._config_file = Path("data/permissions.json")
         self._load_config()
@@ -133,37 +134,38 @@ class PermissionManager:
     def clear_conversation(self, conversation_id: str) -> None:
         with self._lock:
             self._overrides.pop(conversation_id, None)
-            self._confirmations.pop(conversation_id, None)
             self._save_config()
 
-    async def register_confirmation(self, confirmation_id: str) -> Any:
-        import asyncio
+    def _resolve_confirmation(self, confirmation_id: str, approved: bool) -> None:
+        with self._lock:
+            event = self._confirmations.pop(confirmation_id, None)
+            self._decisions[confirmation_id] = approved
+        if event:
+            event.set()
+
+    async def register_confirmation(self, confirmation_id: str) -> asyncio.Event:
         event = asyncio.Event()
         with self._lock:
             self._confirmations[confirmation_id] = event
         return event
 
     async def approve(self, confirmation_id: str) -> None:
-        with self._lock:
-            event = self._confirmations.get(confirmation_id)
-        if event:
-            event.set()
+        self._resolve_confirmation(confirmation_id, True)
 
     async def deny(self, confirmation_id: str) -> None:
-        with self._lock:
-            event = self._confirmations.pop(confirmation_id, None)
-        if event:
-            event.set()
+        self._resolve_confirmation(confirmation_id, False)
 
     async def wait_for_confirmation(
         self, confirmation_id: str, timeout: float = 300.0
     ) -> bool:
-        import asyncio
         event = await self.register_confirmation(confirmation_id)
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
+            with self._lock:
+                self._confirmations.pop(confirmation_id, None)
+                self._decisions.pop(confirmation_id, None)
             return False
 
         with self._lock:
-            return confirmation_id in self._confirmations
+            return self._decisions.pop(confirmation_id, False)

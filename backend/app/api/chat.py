@@ -216,6 +216,17 @@ async def download_workspace(
     if sandbox_pool is None:
         raise HTTPException(status_code=500, detail="Sandbox pool not available")
 
+    engine = request.app.state.engine
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            select(Conversation).where(Conversation.id == uuid.UUID(conversation_id))
+        )
+        conv = result.scalar_one_or_none()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conv.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not your conversation")
+
     adapter = await sandbox_pool.get_or_create(conversation_id)
     zip_bytes = await adapter.download_workspace_zip()
 

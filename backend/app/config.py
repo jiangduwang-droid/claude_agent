@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 from pathlib import Path
@@ -126,7 +127,7 @@ class Config:
     _instance: "Config | None" = None
 
     def __init__(self) -> None:
-        base = DEFAULT_CONFIG.copy()
+        base = copy.deepcopy(DEFAULT_CONFIG)
 
         global_cfg_path = Path.home() / ".config" / "opencode-agent" / "config.json"
         global_cfg = _load_config_file(global_cfg_path)
