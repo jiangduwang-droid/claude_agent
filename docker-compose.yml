@@ -45,6 +45,7 @@ services:
     volumes:
       - ./skills:/app/skills
       - ./data:/app/data
+      - ./.opencode:/app/.opencode
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cca}:${POSTGRES_PASSWORD:-cca_secret}@postgres:5432/${POSTGRES_DB:-cca_db}
       SANDBOX_DOMAIN: "opensandbox-server:8080"
