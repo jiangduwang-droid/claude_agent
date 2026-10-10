@@ -78,20 +78,20 @@ async def login(req: LoginRequest, request: Request):
     engine = request.app.state.engine
     async with engine.begin() as conn:
         result = await conn.execute(select(User).where(User.email == req.email))
-        user = result.scalar_one_or_none()
+        user = result.mappings().one_or_none()
 
-    if not user or not verify_password(req.password, user.password_hash):
+    if not user or not verify_password(req.password, user["password_hash"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
         )
 
-    token = create_access_token(user.id, user.role)
+    token = create_access_token(user["id"], user["role"])
     return TokenResponse(
         access_token=token,
-        user_id=str(user.id),
-        email=user.email,
-        role=user.role,
+        user_id=str(user["id"]),
+        email=user["email"],
+        role=user["role"],
     )
 
 

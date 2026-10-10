@@ -127,12 +127,12 @@ async def compress_conversation(
         result = await conn.execute(
             select(Conversation).where(Conversation.id == conv_uuid)
         )
-        conv = result.scalar_one_or_none()
+        conv = result.mappings().one_or_none()
 
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    if conv.user_id != user.id:
+    if conv["user_id"] != user.id:
         raise HTTPException(status_code=403, detail="Not your conversation")
 
     async with engine.begin() as conn:
@@ -141,14 +141,14 @@ async def compress_conversation(
             .where(Message.conversation_id == conv_uuid)
             .order_by(Message.created_at)
         )
-        messages = result.scalars().all()
+        messages = result.mappings().all()
 
-    old_messages = [m for m in messages if m.role in ("user", "assistant")]
+    old_messages = [m for m in messages if m["role"] in ("user", "assistant")]
     if len(old_messages) < 10:
         return {"status": "not_enough_messages", "count": len(old_messages)}
 
     transcript = "\n\n".join(
-        f"[{m.role}] {m.content}" for m in old_messages[:-6] if m.content
+        f"[{m['role']}] {m['content']}" for m in old_messages[:-6] if m["content"]
     )
 
     try:
@@ -163,7 +163,7 @@ async def compress_conversation(
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
-    metadata = conv.metadata_ or {}
+    metadata = conv["metadata"] or {}
     metadata["compressed_summary"] = summary
     metadata["recent_summary"] = ""
 

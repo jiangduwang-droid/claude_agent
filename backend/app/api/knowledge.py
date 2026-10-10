@@ -34,12 +34,12 @@ async def list_knowledge_bases(
             .where(KnowledgeBase.user_id == user.id)
             .order_by(KnowledgeBase.id.desc())
         )
-        kbs = result.scalars().all()
+        kbs = result.mappings().all()
     return [
         {
-            "id": str(kb.id),
-            "name": kb.name,
-            "description": kb.description,
+            "id": str(kb["id"]),
+            "name": kb["name"],
+            "description": kb["description"],
         }
         for kb in kbs
     ]
@@ -83,11 +83,11 @@ async def get_knowledge_base(
         result = await conn.execute(
             select(KnowledgeBase).where(KnowledgeBase.id == kb_uuid)
         )
-        kb = result.scalar_one_or_none()
+        kb = result.mappings().one_or_none()
 
     if not kb:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
-    if kb.user_id != user.id:
+    if kb["user_id"] != user.id:
         raise HTTPException(status_code=403, detail="Not your knowledge base")
 
     async with engine.begin() as conn:
@@ -95,17 +95,17 @@ async def get_knowledge_base(
             select(Document).where(Document.kb_id == kb_uuid)
             .order_by(Document.id.desc())
         )
-        docs = result.scalars().all()
+        docs = result.mappings().all()
 
     return {
-        "id": str(kb.id),
-        "name": kb.name,
-        "description": kb.description,
+        "id": str(kb["id"]),
+        "name": kb["name"],
+        "description": kb["description"],
         "documents": [
             {
-                "id": str(d.id),
-                "filename": d.filename,
-                "file_type": d.file_type,
+                "id": str(d["id"]),
+                "filename": d["filename"],
+                "file_type": d["file_type"],
                 "chunk_count": 0,
             }
             for d in docs
@@ -124,13 +124,13 @@ async def delete_knowledge_base(
 
     async with engine.begin() as conn:
         result = await conn.execute(
-            select(KnowledgeBase).where(KnowledgeBase.id == kb_uuid)
+            select(KnowledgeBase.user_id).where(KnowledgeBase.id == kb_uuid)
         )
-        kb = result.scalar_one_or_none()
+        owner_id = result.scalar_one_or_none()
 
-    if not kb:
+    if owner_id is None:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
-    if kb.user_id != user.id:
+    if owner_id != user.id:
         raise HTTPException(status_code=403, detail="Not your knowledge base")
 
     async with engine.begin() as conn:
@@ -163,13 +163,13 @@ async def upload_document(
 
     async with engine.begin() as conn:
         result = await conn.execute(
-            select(KnowledgeBase).where(KnowledgeBase.id == kb_uuid)
+            select(KnowledgeBase.user_id).where(KnowledgeBase.id == kb_uuid)
         )
-        kb = result.scalar_one_or_none()
+        owner_id = result.scalar_one_or_none()
 
-    if not kb:
+    if owner_id is None:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
-    if kb.user_id != user.id:
+    if owner_id != user.id:
         raise HTTPException(status_code=403, detail="Not your knowledge base")
 
     content = await file.read()

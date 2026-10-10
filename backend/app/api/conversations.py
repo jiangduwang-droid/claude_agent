@@ -33,15 +33,15 @@ async def list_conversations(
             .where(Conversation.user_id == user.id)
             .order_by(Conversation.id.desc())
         )
-        conversations = result.scalars().all()
+        conversations = result.mappings().all()
 
     return [
         {
-            "id": str(c.id),
-            "title": c.title,
-            "model": c.model,
-            "sandbox_id": c.sandbox_id,
-            "created_at": c.metadata_.get("created_at") if c.metadata_ else None,
+            "id": str(c["id"]),
+            "title": c["title"],
+            "model": c["model"],
+            "sandbox_id": c["sandbox_id"],
+            "created_at": c["metadata"].get("created_at") if c["metadata"] else None,
         }
         for c in conversations
     ]
@@ -107,11 +107,11 @@ async def get_conversation(
         result = await conn.execute(
             select(Conversation).where(Conversation.id == conv_uuid)
         )
-        conv = result.scalar_one_or_none()
+        conv = result.mappings().one_or_none()
 
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if conv.user_id != user.id:
+    if conv["user_id"] != user.id:
         raise HTTPException(status_code=403, detail="Not your conversation")
 
     async with engine.begin() as conn:
@@ -120,21 +120,21 @@ async def get_conversation(
             .where(Message.conversation_id == conv_uuid)
             .order_by(Message.created_at)
         )
-        messages = result.scalars().all()
+        messages = result.mappings().all()
 
     return {
-        "id": str(conv.id),
-        "title": conv.title,
-        "model": conv.model,
-        "sandbox_id": conv.sandbox_id,
+        "id": str(conv["id"]),
+        "title": conv["title"],
+        "model": conv["model"],
+        "sandbox_id": conv["sandbox_id"],
         "messages": [
             {
-                "id": str(m.id),
-                "role": m.role,
-                "content": m.content,
-                "tool_calls": m.tool_calls,
-                "attachments": m.attachments,
-                "created_at": m.created_at.isoformat() if m.created_at else None,
+                "id": str(m["id"]),
+                "role": m["role"],
+                "content": m["content"],
+                "tool_calls": m["tool_calls"],
+                "attachments": m["attachments"],
+                "created_at": m["created_at"].isoformat() if m["created_at"] else None,
             }
             for m in messages
         ],
@@ -153,13 +153,13 @@ async def update_conversation(
 
     async with engine.begin() as conn:
         result = await conn.execute(
-            select(Conversation).where(Conversation.id == conv_uuid)
+            select(Conversation.user_id).where(Conversation.id == conv_uuid)
         )
-        conv = result.scalar_one_or_none()
+        owner_id = result.scalar_one_or_none()
 
-    if not conv:
+    if owner_id is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if conv.user_id != user.id:
+    if owner_id != user.id:
         raise HTTPException(status_code=403, detail="Not your conversation")
 
     if req.title:
@@ -185,13 +185,14 @@ async def delete_conversation(
 
     async with engine.begin() as conn:
         result = await conn.execute(
-            select(Conversation).where(Conversation.id == conv_uuid)
+            select(Conversation.user_id, Conversation.sandbox_id)
+            .where(Conversation.id == conv_uuid)
         )
-        conv = result.scalar_one_or_none()
+        conv = result.mappings().one_or_none()
 
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if conv.user_id != user.id:
+    if conv["user_id"] != user.id:
         raise HTTPException(status_code=403, detail="Not your conversation")
 
     async with engine.begin() as conn:
@@ -206,10 +207,10 @@ async def delete_conversation(
         permission_manager.clear_conversation(conversation_id)
 
     sandbox_pool = getattr(request.app.state, "sandbox_pool", None)
-    if sandbox_pool and conv.sandbox_id:
+    if sandbox_pool and conv["sandbox_id"]:
         try:
             async with sandbox_pool._lock:
-                sandbox_pool._remove_locked(conv.sandbox_id)
+                sandbox_pool._remove_locked(conv["sandbox_id"])
         except Exception:
             pass
 

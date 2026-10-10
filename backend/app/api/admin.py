@@ -44,14 +44,14 @@ async def list_users(
     engine = request.app.state.engine
     async with engine.begin() as conn:
         result = await conn.execute(select(User).order_by(User.created_at.desc()))
-        users = result.scalars().all()
+        users = result.mappings().all()
 
     return [
         {
-            "id": str(u.id),
-            "email": u.email,
-            "role": u.role,
-            "created_at": u.created_at.isoformat() if u.created_at else None,
+            "id": str(u["id"]),
+            "email": u["email"],
+            "role": u["role"],
+            "created_at": u["created_at"].isoformat() if u["created_at"] else None,
         }
         for u in users
     ]

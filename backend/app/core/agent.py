@@ -37,6 +37,23 @@ def classify_error(error: Exception) -> ErrorCategory:
     return ErrorCategory.RETRYABLE
 
 
+def _runtime_config() -> dict:
+    """构建 ToolNode 独立调用所需的 Runtime 配置。
+
+    langgraph-prebuilt 的 ToolNode 要求运行时注入 Runtime,脱离图直接调用时必须手动提供。
+    """
+    try:
+        from langgraph._internal._constants import CONF, CONFIG_KEY_RUNTIME
+        from langgraph.runtime import Runtime
+    except Exception:
+        try:
+            from langgraph.constants import CONF, CONFIG_KEY_RUNTIME
+            from langgraph.runtime import Runtime
+        except Exception:
+            return {}
+    return {CONF: {CONFIG_KEY_RUNTIME: Runtime()}}
+
+
 @dataclass
 class StepTracker:
     max_steps: int = 25
@@ -517,8 +534,15 @@ async def stream_agent_response(
             return
 
         if tool_node:
-            results = await tool_node.ainvoke(filtered_tool_calls)
-            tool_messages = results if isinstance(results, list) else [results]
+            raw = await tool_node.ainvoke(
+                filtered_tool_calls, config=_runtime_config()
+            )
+            if isinstance(raw, dict) and "messages" in raw:
+                tool_messages = raw["messages"]
+            elif isinstance(raw, list):
+                tool_messages = raw
+            else:
+                tool_messages = [raw]
             for tm in tool_messages:
                 messages.append(tm)
                 if on_tool_result:
