@@ -79,11 +79,18 @@ class RAGService:
         self, doc_id: uuid.UUID, content: str, filename: str = ""
     ) -> int:
         chunks = self._chunk_text(content)
-        embedder = self._get_embedder()
+        try:
+            embedder = self._get_embedder()
+        except Exception as e:
+            print(f"[RAG] Embedder unavailable, indexing without vectors: {e}")
+            embedder = None
 
         chunk_data = []
         for i, chunk in enumerate(chunks):
-            embedding = embedder.encode(chunk["content"])
+            embedding = None
+            if embedder is not None:
+                emb = embedder.encode(chunk["content"])
+                embedding = emb.tolist() if hasattr(emb, "tolist") else list(emb)
             tokenized = self._tokenize(chunk["content"])
             chunk_data.append({
                 "id": uuid.uuid4(),
@@ -92,7 +99,7 @@ class RAGService:
                 "content_tokens": tokenized,
                 "heading_path": chunk["heading_path"],
                 "chunk_index": i,
-                "embedding": embedding.tolist() if hasattr(embedding, "tolist") else list(embedding),
+                "embedding": embedding,
             })
 
         async with self._engine.begin() as conn:
@@ -224,14 +231,17 @@ class RAGService:
         rrf_k = self._config.rag_config.get("rrf_k", 5) if self._config else 5
         rerank_timeout = self._config.rag_config.get("rerank_timeout", 3.0) if self._config else 3.0
 
-        try:
-            bm25_task = asyncio.create_task(self._bm25_search(query, kb_ids, bm25_top_k))
-            vector_task = asyncio.create_task(self._vector_search(query, kb_ids, vector_top_k))
-            bm25_results, vector_results = await asyncio.gather(bm25_task, vector_task)
-        except Exception as e:
-            print(f"[RAG] Parallel search failed, falling back to serial: {e}")
-            bm25_results = await self._bm25_search(query, kb_ids, bm25_top_k)
-            vector_results = await self._vector_search(query, kb_ids, vector_top_k)
+        results = await asyncio.gather(
+            self._bm25_search(query, kb_ids, bm25_top_k),
+            self._vector_search(query, kb_ids, vector_top_k),
+            return_exceptions=True,
+        )
+        bm25_results = results[0] if not isinstance(results[0], BaseException) else []
+        vector_results = results[1] if not isinstance(results[1], BaseException) else []
+        if isinstance(results[0], BaseException):
+            print(f"[RAG] BM25 search failed: {results[0]}")
+        if isinstance(results[1], BaseException):
+            print(f"[RAG] Vector search failed: {results[1]}")
 
         fused = self._rrf_fuse(bm25_results, vector_results, rrf_k)
         if not fused:
