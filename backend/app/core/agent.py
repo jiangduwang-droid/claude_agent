@@ -9,6 +9,7 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.config import Config
@@ -210,6 +211,7 @@ def _make_sandbox_tool(tool_name: str, func: Any, tool_timeout: int = 60) -> Bas
         coroutine=_run,
         name=tool_name,
         description=SANDBOX_TOOL_DESCRIPTIONS.get(tool_name, f"Sandbox tool: {tool_name}"),
+        args_schema=SANDBOX_TOOL_SCHEMAS.get(tool_name),
     )
 
 
@@ -271,6 +273,82 @@ SANDBOX_TOOL_DESCRIPTIONS = {
         "在沙箱中创建目录。"
         "参数: path(目录路径)。"
     ),
+}
+
+
+class ReadFileArgs(BaseModel):
+    path: str = Field(..., description="文件路径")
+    start_line: int = Field(1, description="起始行号,从1开始")
+    length: int = Field(100, description="读取的行数")
+
+
+class WriteFileArgs(BaseModel):
+    path: str = Field(..., description="文件路径")
+    content: str = Field(..., description="要写入的完整文件内容")
+
+
+class ListFilesArgs(BaseModel):
+    path: str = Field("/home/admin/workspace", description="目录路径")
+    pattern: str = Field("*", description="文件名匹配模式(glob)")
+
+
+class ExecuteCodeArgs(BaseModel):
+    code: str = Field(..., description="要执行的Python代码")
+    language: str = Field("python", description="语言,默认python")
+
+
+class ExecuteCommandArgs(BaseModel):
+    command: str = Field(..., description="要执行的Shell命令")
+
+
+class GlobFilesArgs(BaseModel):
+    pattern: str = Field(..., description="glob匹配模式,如 **/*.py")
+    path: str = Field("/home/admin/workspace", description="搜索起始路径")
+
+
+class GrepFilesArgs(BaseModel):
+    pattern: str = Field(..., description="要搜索的正则模式")
+    path: str = Field("/home/admin/workspace", description="搜索路径")
+    file_pattern: str = Field("*", description="文件匹配模式")
+
+
+class EditFileArgs(BaseModel):
+    path: str = Field(..., description="文件路径")
+    old_text: str = Field(..., description="要被替换的原文本")
+    new_text: str = Field(..., description="替换后的新文本")
+
+
+class ApplyPatchArgs(BaseModel):
+    path: str = Field(..., description="文件路径")
+    diff: str = Field(..., description="unified diff格式的补丁内容")
+
+
+class WebFetchArgs(BaseModel):
+    url: str = Field(..., description="要获取的URL")
+
+
+class SearchFilesArgs(BaseModel):
+    query: str = Field(..., description="搜索关键词")
+    path: str = Field("/home/admin/workspace", description="搜索路径")
+
+
+class MakeDirectoryArgs(BaseModel):
+    path: str = Field(..., description="要创建的目录路径")
+
+
+SANDBOX_TOOL_SCHEMAS: dict[str, type[BaseModel]] = {
+    "read_file": ReadFileArgs,
+    "write_file": WriteFileArgs,
+    "list_files": ListFilesArgs,
+    "execute_code": ExecuteCodeArgs,
+    "execute_command": ExecuteCommandArgs,
+    "glob_files": GlobFilesArgs,
+    "grep_files": GrepFilesArgs,
+    "edit_file": EditFileArgs,
+    "apply_patch": ApplyPatchArgs,
+    "web_fetch": WebFetchArgs,
+    "search_files": SearchFilesArgs,
+    "make_directory": MakeDirectoryArgs,
 }
 
 
