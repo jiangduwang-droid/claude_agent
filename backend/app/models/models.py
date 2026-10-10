@@ -103,7 +103,7 @@ class DocumentChunk(Base):
         UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    content_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content_tokens: Mapped[str | None] = mapped_column(Text, nullable=True)
     heading_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     embedding: Mapped[Any | None] = mapped_column(Vector(512), nullable=True)

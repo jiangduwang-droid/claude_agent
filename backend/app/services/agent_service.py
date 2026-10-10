@@ -40,11 +40,17 @@ class AgentService:
         self._config = Config.get()
         self._headroom = HeadroomService.get_instance()
         self._locks: dict[str, asyncio.Lock] = {}
+        self._agent_locks: dict[str, asyncio.Lock] = {}
 
     def _get_lock(self, conversation_id: str) -> asyncio.Lock:
         if conversation_id not in self._locks:
             self._locks[conversation_id] = asyncio.Lock()
         return self._locks[conversation_id]
+
+    def _get_agent_lock(self, conversation_id: str) -> asyncio.Lock:
+        if conversation_id not in self._agent_locks:
+            self._agent_locks[conversation_id] = asyncio.Lock()
+        return self._agent_locks[conversation_id]
 
     async def _get_or_create_agent(
         self,
@@ -56,7 +62,7 @@ class AgentService:
         if conversation_id in self._agent_cache and conversation_id not in self._stale:
             return self._agent_cache[conversation_id]
 
-        lock = self._get_lock(conversation_id)
+        lock = self._get_agent_lock(conversation_id)
         async with lock:
             if conversation_id in self._agent_cache and conversation_id not in self._stale:
                 return self._agent_cache[conversation_id]

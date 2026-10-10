@@ -53,6 +53,7 @@ async def create_knowledge_base(
 ):
     engine = request.app.state.engine
     kb = KnowledgeBase(
+        id=uuid.uuid4(),
         user_id=user.id,
         name=req.name,
         description=req.description,
@@ -186,6 +187,7 @@ async def upload_document(
             print(f"[Knowledge] PDF parsing failed: {e}")
 
     doc = Document(
+        id=uuid.uuid4(),
         kb_id=kb_uuid,
         filename=file.filename or "unknown",
         file_type=file_type,

@@ -181,8 +181,15 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
 
         await conn.execute(__import__("sqlalchemy").text(
-            "CREATE INDEX IF NOT EXISTS idx_doc_chunks_content_ts "
-            "ON document_chunks USING gin(to_tsvector('simple', content))"
+            "ALTER TABLE document_chunks "
+            "ALTER COLUMN content_tokens TYPE text USING content_tokens::text"
+        ))
+        await conn.execute(__import__("sqlalchemy").text(
+            "DROP INDEX IF EXISTS idx_doc_chunks_content_ts"
+        ))
+        await conn.execute(__import__("sqlalchemy").text(
+            "CREATE INDEX IF NOT EXISTS idx_doc_chunks_tokens_ts "
+            "ON document_chunks USING gin(to_tsvector('simple', content_tokens))"
         ))
         await conn.execute(__import__("sqlalchemy").text(
             "CREATE INDEX IF NOT EXISTS idx_doc_chunks_embedding_hnsw "

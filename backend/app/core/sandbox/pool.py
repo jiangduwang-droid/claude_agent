@@ -106,6 +106,10 @@ class SandboxPoolManager:
         await sandbox.check_ready(
             timeout=timedelta(seconds=60), polling_interval=timedelta(seconds=2)
         )
+        try:
+            await sandbox.commands.run("mkdir -p /home/admin/workspace")
+        except Exception as e:
+            print(f"[SandboxPool] Workspace init failed: {e}")
         return sandbox
 
     async def _unpause_if_needed(self, sandbox_id: str) -> None:

@@ -35,14 +35,14 @@ async def chat_stream(
     conv_uuid = uuid.UUID(conversation_id)
     async with engine.begin() as conn:
         result = await conn.execute(
-            select(Conversation).where(Conversation.id == conv_uuid)
+            select(Conversation.user_id).where(Conversation.id == conv_uuid)
         )
-        conv = result.scalar_one_or_none()
+        owner_id = result.scalar_one_or_none()
 
-    if not conv:
+    if owner_id is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    if conv.user_id != user.id:
+    if owner_id != user.id:
         raise HTTPException(status_code=403, detail="Not your conversation")
 
     if skills_registry is None:
@@ -219,12 +219,12 @@ async def download_workspace(
     engine = request.app.state.engine
     async with engine.begin() as conn:
         result = await conn.execute(
-            select(Conversation).where(Conversation.id == uuid.UUID(conversation_id))
+            select(Conversation.user_id).where(Conversation.id == uuid.UUID(conversation_id))
         )
-        conv = result.scalar_one_or_none()
-    if not conv:
+        owner_id = result.scalar_one_or_none()
+    if owner_id is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if conv.user_id != user.id:
+    if owner_id != user.id:
         raise HTTPException(status_code=403, detail="Not your conversation")
 
     adapter = await sandbox_pool.get_or_create(conversation_id)

@@ -1,4 +1,5 @@
 import re
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field
@@ -48,6 +49,7 @@ async def register(req: RegisterRequest, request: Request):
             )
 
     user = User(
+        id=uuid.uuid4(),
         email=req.email,
         password_hash=hash_password(req.password),
         role="user",

@@ -58,6 +58,7 @@ async def create_conversation(
     permission_manager: PermissionManager = getattr(request.app.state, "permission_manager", None)
 
     conv = Conversation(
+        id=uuid.uuid4(),
         user_id=user.id,
         title=req.title,
         model=req.model,
@@ -75,14 +76,14 @@ async def create_conversation(
 
     async with engine.begin() as conn:
         await conn.execute(
-            Conversation.__table__.insert().values(
-                id=conv.id,
-                user_id=conv.user_id,
-                title=conv.title,
-                sandbox_id=conv.sandbox_id,
-                model=conv.model,
-                metadata_=conv.metadata_,
-            )
+            Conversation.__table__.insert().values({
+                "id": conv.id,
+                "user_id": conv.user_id,
+                "title": conv.title,
+                "sandbox_id": conv.sandbox_id,
+                "model": conv.model,
+                "metadata": conv.metadata_,
+            })
         )
 
     return {
