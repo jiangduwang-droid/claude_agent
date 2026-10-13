@@ -698,25 +698,33 @@ ReAct 的特点是**走一步看一步**：每做一步都调一次 LLM 重新�
      └──────────┘
           │
           ├─ 还有剩余步骤 → 回 executor（循环）
-          └─ 计划已完成  → END
+          └─ 计划已完成  ──► ┌───────────┐
+                            │ summarize │  ③ 把所有步骤结果汇成最终回答
+                            └───────────┘
+                                  │
+                                  ▼
+                                 END
 ```
 
-代码实现见 [plan_and_execute.py](file:///workspace/claude_agent/learn-agent/plan_and_execute.py)，核心是三个节点加两条条件边：
+代码实现见 [plan_and_execute.py](file:///workspace/claude_agent/learn-agent/plan_and_execute.py)，核心是四个节点加两条条件边：
 
 ```python
 graph.add_edge(START, "planner")           # 先规划
 graph.add_edge("planner", "executor")       # 再执行
 graph.add_conditional_edges("executor", should_continue, {
-    "tools": "tools",       # 需要工具 → 执行工具
-    "replan": "replanner",  # 不需要工具 → 交给审查
-    END: END,
+    "tools": "tools",         # 需要工具 → 执行工具
+    "replan": "replanner",    # 不需要工具 → 交给审查
+    "summarize": "summarize", # 计划已跑完 → 汇总
 })
 graph.add_edge("tools", "replanner")
 graph.add_conditional_edges("replanner", should_replan, {   # ← 必须是条件边
-    "executor": "executor",  # 还有剩余步骤 → 继续执行
-    END: END,                # 计划已完成 → 结束
+    "executor": "executor",     # 还有剩余步骤 → 继续执行
+    "summarize": "summarize",   # 计划已完成 → 汇总收尾（不是直接 END）
 })
+graph.add_edge("summarize", END)
 ```
+
+> **另一个真实的坑（也是写这个示例时踩到的）**：如果「计划完成」直接连到 `END`，运行结束时**只有一串 `[工具返回]`，没有最终回答**。因为最后一个步骤调完工具后，控制流是 `executor → tools → replanner`，工具结果从没机会被 LLM「翻译」成人话。ReAct 里 `tools → agent` 会回到 LLM 再作答，Plan-and-Execute 缺的正是这一环——所以要补一个 `summarize`（solver）节点：**凡是「以工具调用收尾」的图，都要有一个节点负责把结果汇成最终回答。**
 
 > **一个真实的坑（写这个示例时踩到的）**：`replanner → executor` 这条边**不能是无条件边**。因为 `replanner` 会把 `current_step` 推进到 `len(plan)`（判 DONE 时，或它补的新步骤为空时），此时若无条件回到 `executor`，`plan[current_step]` 就会越界，抛 `IndexError: list index out of range`。**凡是「循环回边」都要想清楚退出条件**——这是 Plan-and-Execute 和 Reflexion、ToT 都容易犯的错。
 
@@ -746,6 +754,10 @@ graph.add_conditional_edges("replanner", should_replan, {   # ← 必须是条�
   ...
   [执行] calculate({'expression': '2400 + 1800 + 2250 + 1000'})  →  7450   # 依赖式汇总
   [执行] calculate({'expression': '7450 / 5'})                  →  1490.0
+  [执行] calculate({'expression': '7450 - 12000'})              →  -4550
+
+  [最终回答] 北京 5 人 3 天团建预算：交通 2400 + 住宿 1800 + 餐饮 2250 + 活动 1000
+            = 总预算 7450 元，人均 1490 元，未超过 12000 元上限（余 4550 元）。   ← summarize 节点产出
 ```
 
 > **一个必须注意的实现细节**：`executor` 调用 LLM 时，**必须把 `state["messages"]`（前面所有步骤及其工具结果）一起带上**。
@@ -1071,13 +1083,36 @@ sudo apt-get install -y nodejs
 ```python
 def should_replan(state: PlanExecuteState) -> str:
     if state["current_step"] >= len(state["plan"]):
-        return END
+        return "summarize"   # 计划完成 → 去汇总收尾（而不是直接 END）
     return "executor"
 
-graph.add_conditional_edges("replanner", should_replan, {"executor": "executor", END: END})
+graph.add_conditional_edges("replanner", should_replan, {
+    "executor": "executor",
+    "summarize": "summarize",
+})
 ```
 
 **通用教训**：**凡是让控制流「绕回去」的边，都必须同时想清楚「什么时候不再绕」**。ReAct 靠 `tools_condition` 退出，Reflexion 靠 `MAX_RETRIES` 退出，ToT 靠 `MAX_DEPTH` 退出，Plan-and-Execute 靠「剩余步骤数归零」退出——一个都不能少。
+
+### 10.11 计划跑完只剩工具输出、没有最终回答
+
+**现象**：跑 `plan_and_execute.py` 到最后，屏幕上只有一串 `[工具返回]`，看不到「结论是什么」。
+**原因**：完成的出口直接连到了 `END`。最后一个步骤调完工具后，控制流是 `executor → tools → replanner`，工具结果从没回到 LLM 手里被「翻译」成自然语言。ReAct 里 `tools → agent` 会回到 LLM 再作答，Plan-and-Execute 缺的正是这一环。
+**解法**：在完成出口加一个 `summarize`（solver）节点，让它带着全部历史再调一次 LLM 产出最终回答：
+
+```python
+def summarize(state):
+    response = llm.invoke([
+        SystemMessage(content=SUMMARIZER_PROMPT),
+        *state["messages"],                       # 带上全过程
+        HumanMessage(content="请根据以上步骤及结果，直接给出最终结论。"),
+    ])
+    return {"messages": [response]}
+
+graph.add_edge("summarize", END)
+```
+
+**通用教训**：**凡是「以工具调用收尾」的图，都必须有一个节点负责把工具结果汇成最终回答**（ReAct 靠 `agent` 节点兼任，ReWOO 靠 `solver` 节点，Plan-and-Execute 要自己补 `summarize`）。
 
 ---
 

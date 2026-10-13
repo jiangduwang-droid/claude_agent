@@ -9,7 +9,10 @@ ReAct 是「走一步看一步」，Plan-and-Execute 是「先想好再批量做
                             ↑                                        │
                             └────(还有剩余步骤)──────────────────────┤
                                                                      │
-                                          (计划已完成) ───────────────┴──→ END
+                                          (计划已完成) ───────────────┴──→ [summarize] → END
+
+注意最后这个 [summarize]：计划跑完后，用一次 LLM 把「各步骤的工具结果」汇成给用户的
+最终回答。没有它，运行会停在最后一条工具输出上，用户只看得到一串数字，看不到结论。
 
 适用场景：复杂多步任务，先规划能减少中途偏航。
 
@@ -65,6 +68,9 @@ REPLANNER_PROMPT = """你是一个计划审查器。你会看到整体任务、�
 2. 否则，给出【接下来还要执行】的步骤。只列尚未完成的步骤，不要把已完成的步骤再列一遍；
    如果原计划需要调整（结果不对、需要补充步骤），直接给出修正后的剩余步骤。
 输出格式：完成则只回复 DONE；否则每行一个步骤，不要编号，不要额外解释。"""
+
+SUMMARIZER_PROMPT = """你是一个汇报者。你会看到整个任务的执行过程和各步骤的结果。
+请据此直接回答用户的原始问题：给出关键数字和明确结论，简洁清晰，用中文；不要调用任何工具。"""
 
 
 def build_plan_and_execute():
@@ -122,27 +128,41 @@ def build_plan_and_execute():
             "current_step": step_idx + 1,
         }
 
+    def summarize(state: PlanExecuteState) -> dict:
+        """节点 4：所有步骤跑完后，把过程汇成给用户的最终回答。
+
+        缺了这个节点，图会在最后一条工具输出上结束——用户只能看到一串
+        「[工具返回] xxx」，却看不到「结论是什么」。这一步相当于给 Agent
+        补上 solver（汇总）环节，对照 ReWOO 的 solver 节点。
+        """
+        response = llm.invoke([
+            SystemMessage(content=SUMMARIZER_PROMPT),
+            *state["messages"],
+            HumanMessage(content="请根据以上已完成的步骤及其结果，直接给出最终结论。"),
+        ])
+        return {"messages": [response]}
+
     def should_continue(state: PlanExecuteState) -> str:
         """条件边：判断下一步去哪。"""
         # 如果 LLM 回复里有 tool_calls，先去执行工具
         last_msg = state["messages"][-1]
         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
             return "tools"
-        # 如果计划执行完了，结束
+        # 如果计划已经执行完，去汇总出最终回答
         if state["current_step"] >= len(state["plan"]):
-            return END
+            return "summarize"
         # 否则去 re-planner 审查
         return "replan"
 
     def should_replan(state: PlanExecuteState) -> str:
-        """条件边：审查后还有剩余步骤就继续执行，否则结束。
+        """条件边：审查后还有剩余步骤就继续执行，否则去汇总收尾。
 
         这一步是必须的——replanner 会把 current_step 推进到 len(plan)
         （判 DONE 时，或它补的新步骤为空时），如果此时还无条件回 executor，
         就会访问 plan[current_step] 越界崩溃。
         """
         if state["current_step"] >= len(state["plan"]):
-            return END
+            return "summarize"
         return "executor"
 
     graph = StateGraph(PlanExecuteState)
@@ -150,20 +170,22 @@ def build_plan_and_execute():
     graph.add_node("executor", executor)
     graph.add_node("tools", ToolNode(TOOLS))
     graph.add_node("replanner", replanner)
+    graph.add_node("summarize", summarize)
 
     graph.add_edge(START, "planner")
     graph.add_edge("planner", "executor")
     graph.add_conditional_edges("executor", should_continue, {
         "tools": "tools",
         "replan": "replanner",
-        END: END,
+        "summarize": "summarize",
     })
     graph.add_edge("tools", "replanner")  # 工具结果 → 审查
-    # 审查完 → 有剩余步骤就执行下一步，否则结束（不能无条件回 executor）
+    # 审查完 → 有剩余步骤就执行下一步，否则去汇总收尾（不能无条件回 executor）
     graph.add_conditional_edges("replanner", should_replan, {
         "executor": "executor",
-        END: END,
+        "summarize": "summarize",
     })
+    graph.add_edge("summarize", END)  # 汇总出最终回答 → 结束
     return graph.compile()
 
 
@@ -208,6 +230,10 @@ def main():
             elif node == "tools":
                 for msg in update.get("messages", []):
                     print(f"  [工具返回] {str(msg.content)[:200]}")
+            elif node == "summarize":
+                for msg in update.get("messages", []):
+                    if msg.content:
+                        print(f"\n  [最终回答] {msg.content}\n")
 
 
 if __name__ == "__main__":
