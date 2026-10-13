@@ -8,18 +8,22 @@
 ## 0. 这份文档怎么用
 
 - **第 1、2 章是「思想与概念」**：不理解 Agent 的本质和图式编排，代码就只是抄。
-- **第 3、4、5 章是「代码解读」**：逐文件、逐段讲清楚每个设计的意图。
-- **第 6、7 章是「对照与工程化」**：把示例和真实项目（`claude_agent`）对上，并补上生产环境才需要考虑的东西。
-- **第 8、9 章是「练习与避坑」**：动手清单 + 已知的坑。
+- **第 3、4、5、6 章是「代码解读」**：逐文件、逐段讲清楚每个设计的意图（基础 Agent → Skill → MCP → 规划框架）。
+- **第 7、8 章是「对照与工程化」**：把示例和真实项目（`claude_agent`）对上，并补上生产环境才需要考虑的东西。
+- **第 9、10 章是「练习与避坑」**：动手清单 + 已知的坑。
 
 代码目录结构：
 
 ```
 learn-agent/
-├── step1_agent.py            # 最小 Agent：LLM + Tools + Loop
+├── step1_agent.py            # 最小 Agent：LLM + Tools + Loop（ReAct）
 ├── step2_skills.py           # 加载 Skill（代码匹配版）：关键词 + 二元组
 ├── step2_skills_llm.py       # 加载 Skill（LLM 匹配版）：懒加载，和 Claude Code 一致
 ├── step3_mcp.py              # 接入 MCP：把外部工具接进来
+├── plan_and_execute.py       # 规划框架：先规划再执行（Plan-and-Execute）
+├── reflexion.py              # 规划框架：自我反思再重试（Reflexion）
+├── rewoo.py                  # 规划框架：一次规划批量执行（ReWOO）
+├── tot.py                    # 规划框架：多路径探索选优（Tree of Thoughts）
 ├── skills/
 │   ├── git-commit/SKILL.md   # Markdown 技能（只有提示词）
 │   └── unit-convert/skill.py # Python 技能（提供真实工具）
@@ -191,7 +195,7 @@ def calculate(expression: str) -> str:
 | **docstring** `"""计算数学表达式..."""` | 工具描述 | 判断「什么时候」该调用它 |
 
 > **这是新手最容易踩的坑**：如果函数没有类型注解，工具的参数 schema 就是空的，LLM 不知道要传什么，就会报「缺少参数」或者干脆不调用。
-> 你在 `claude_agent` 项目里遇到的 `StructuredTool` 参数绑定失败问题，根因就在这里。修法是给工具显式传入 `args_schema`（见 7.1）。
+> 你在 `claude_agent` 项目里遇到的 `StructuredTool` 参数绑定失败问题，根因就在这里。修法是给工具显式传入 `args_schema`（见 8.1）。
 
 三个工具组成了 Agent 的「能力集」：
 
@@ -289,7 +293,7 @@ def build_system_prompt(
 )
 ```
 
-**一句话：上下文窗口是固定大小的，但 Agent 的记忆可以是无限的——前提是你愿意做「压缩 + 外置 + 按需检索」这套工程。** 这也是 7.4 节讲的「框架不替代工程」。
+**一句话：上下文窗口是固定大小的，但 Agent 的记忆可以是无限的——前提是你愿意做「压缩 + 外置 + 按需检索」这套工程。** 这也是 8.4 节讲的「框架不替代工程」。
 
 ### 3.3 组装图：把循环画出来
 
@@ -648,7 +652,198 @@ async def main() -> None:
 
 ---
 
-## 6. 对照篇：示例代码 vs 你现有的 `claude_agent` 项目
+## 6. 实战篇四：规划框架（不止 ReAct）
+
+前面第 3 章讲的 ReAct 是最基础、也最常用的模式。但面对不同类型的问题，社区演化出了几种不同的「思考流程」，思路各有侧重。
+
+### 6.1 为什么不能只有 ReAct
+
+ReAct 的特点是**走一步看一步**：每做一步都调一次 LLM 重新决定下一步。这有两个问题：
+
+- **缺乏全局规划**：十几步的任务，容易中途跑偏、兜圈子。
+- **LLM 调用次数多**：每一步都要调 LLM，token 成本高、延迟大。
+
+针对这两点，出现了不同的改良框架：
+
+| 框架 | 想解决的问题 | 一句话 |
+|---|---|---|
+| **ReAct** | 基础工具调用 | 走一步看一步 |
+| **Plan-and-Execute** | ReAct 缺全局规划 | 先想好整体计划，再逐步执行 |
+| **Reflexion** | 输出质量不稳定 | 做完回头检查，不满意就重试 |
+| **ReWOO** | ReAct 调用 LLM 太多 | 一次性生成全部工具调用，批量执行 |
+| **Tree of Thoughts** | 单路径容易走进死胡同 | 同时探索多条路径，评估后选最优 |
+
+**关键认知**：这些框架**不会改变 Agent 的本质**（还是 LLM + Tools + Loop），它们只是**改变了图的拓扑结构**。节点和工具都是复用的，变的只是「谁连谁、循环几次」。
+
+### 6.2 Plan-and-Execute：先规划，再执行
+
+**思想**：先让 LLM 产出一份完整的步骤清单，再按清单逐步执行。执行中如果发现计划需要调整，就回去改计划。
+
+```
+        START
+          │
+          ▼
+     ┌──────────┐
+     │ planner  │  ① 一次性生成全部步骤
+     └──────────┘
+          │
+          ▼
+     ┌──────────┐   有 tool_calls   ┌──────────┐
+     │ executor │ ────────────────► │  tools   │
+     └──────────┘                   └──────────┘
+          │                              │
+          │ 无 tool_calls                │
+          ▼                              │
+     ┌──────────┐ ◄──────────────────────┘
+     │replanner │  ② 审查结果：继续 / 改计划 / DONE
+     └──────────┘
+          │
+          ▼
+     ┌──────────┐
+     │ executor │  ③ 执行下一步（循环）
+     └──────────┘
+```
+
+代码实现见 [plan_and_execute.py](file:///workspace/claude_agent/learn-agent/plan_and_execute.py)，核心是三个节点加一条循环边：
+
+```python
+graph.add_edge(START, "planner")          # 先规划
+graph.add_edge("planner", "executor")      # 再执行
+graph.add_conditional_edges("executor", should_continue, {
+    "tools": "tools",       # 需要工具 → 执行工具
+    "replan": "replanner",  # 不需要工具 → 交给审查
+    END: END,
+})
+graph.add_edge("tools", "replanner")
+graph.add_edge("replanner", "executor")    # 审查完 → 继续执行下一步
+```
+
+**和 ReAct 的差别**：ReAct 的 `call_model` 节点既负责「想」也负责「决定要不要继续」；Plan-and-Execute 把「想」拆成两步——`planner`（定计划）和 `replanner`（改计划），中间夹着纯粹的 `executor`。
+
+**适用**：复杂多步任务、需要先分解再执行。**缺点**：计划可能过时，需要 `replanner` 兜底修正。
+
+### 6.3 Reflexion：做完反思，不行重试
+
+**思想**：在 ReAct 基础上，执行结束后加一个「审查」节点。审查不通过就把反馈塞回消息里，让 Agent 重新回答。
+
+```
+        START → [agent] → [tools] ─┐
+                   ▲               │
+                   │               ▼
+                   │           [reflect] ──(不通过)──┐
+                   │               │                │
+                   └───────────────┘◄───────────────┘
+                                   │ (通过)
+                                   ▼
+                                  END
+```
+
+核心是给条件边加了「不通过就回 `agent`」这条路，并把审查意见作为一条 `HumanMessage` 追加进消息：
+
+```python
+if not passed and reflection_count < MAX_RETRIES:
+    feedback = HumanMessage(content=f"审查反馈：{result.content}\n请根据反馈修正你的回答。")
+    return {"messages": [feedback], "passed": False, "reflections": reflection_count}
+```
+
+实现见 [reflexion.py](file:///workspace/claude_agent/learn-agent/reflexion.py)。注意这里用 `MAX_RETRIES` **兜底**，否则审查自己出错时会无限循环。
+
+**适用**：需要高质量输出的场景（代码生成、数学推理）。**代价**：额外一次 LLM 调用（审查本身也要调模型）。
+
+### 6.4 ReWOO：一次规划，批量执行
+
+**思想**：把「规划」和「执行」彻底分开。让 LLM 一次性把所有工具调用写出来（用 `#E1`、`#E2` 这样的占位符），然后自己的代码去**批量执行**，最后再调一次 LLM 汇总。
+
+```
+    START → [planner] → [executor] → [solver] → END
+              │            │            │
+              │  调 LLM    │  不调 LLM   │  调 LLM
+              ▼            ▼            ▼
+          生成全部调用   纯代码批量执行   汇总结果
+```
+
+一次运行只调 **2 次 LLM**（规划 + 汇总），中间的执行环节完全不调 LLM：
+
+```
+ReAct:  LLM → 工具 → LLM → 工具 → LLM → ...   （N 次 LLM 调用）
+ReWOO:  LLM(规划) → 工具 → 工具 → 工具 → LLM(汇总)   （2 次 LLM 调用）
+```
+
+实现见 [rewoo.py](file:///workspace/claude_agent/learn-agent/rewoo.py)，关键是用正则解析占位符，并把 `#E1` 这样的引用替换成实际结果：
+
+```python
+m = re.match(r'#(E\d+)\s*=\s*(\w+)\((.*)\)', step)
+eid, tool_name, raw_args = m.groups()
+for ref_id, ref_val in results.items():
+    raw_args = raw_args.replace(ref_id, str(ref_val))   # #E1 → 实际结果
+```
+
+**适用**：步骤可预先确定的场景（批量查询、数据 ETL）。**代价**：计划是「一次性」的，中途无法根据新信息调整，规划错了就得重来。
+
+### 6.5 Tree of Thoughts：同时探索多条路
+
+**思想**：面对有多个可能方向的问题，不要只走一条路。每轮生成 N 个候选思路，评估打分，选最优的继续往下走。
+
+```
+        START → [generate] → [evaluate] ─┐
+                    ▲                   │
+                    │                   │
+                    └──(最优分不够高)────┘
+                                        │ (够高 或 到深度上限)
+                                        ▼
+                                      [solve] → END
+```
+
+生成时**必须提高温度**（`temperature=0.7`），否则每次生成的思路会高度雷同，失去「探索多条路径」的意义：
+
+```python
+llm = ChatOpenAI(model=MODEL, base_url=BASE_URL, temperature=0.7)
+```
+
+实现见 [tot.py](file:///workspace/claude_agent/learn-agent/tot.py)。评估节点让 LLM 给每条思路打分，条件边根据最高分决定「继续扩展还是收尾」。
+
+**适用**：逻辑推理、创意写作、24 点这类需要搜索最优解的问题。**代价**：token 消耗最大，因为每轮要生成+评估多个候选项。
+
+### 6.6 四种框架横向对比
+
+| | ReAct | Plan-and-Execute | Reflexion | ReWOO | Tree of Thoughts |
+|---|---|---|---|---|---|
+| 核心动作 | 想一步做一步 | 先规划再执行 | 做完自检重试 | 一次规划批量执行 | 多路径探索选优 |
+| 图特征 | 单循环 | 规划→执行→审查 | 执行→反思循环 | 线性三段 | 生成→评估循环 |
+| LLM 调用次数 | 每步 1 次（多） | 中等 | 多（含反思） | **少（固定 2 次）** | 最多 |
+| token 成本 | 中 | 中 | 高 | **低** | 高 |
+| 抗跑偏 | 弱 | 强 | 强 | 弱（计划固定） | 强（会择优） |
+| 输出质量 | 一般 | 好 | **高** | 一般 | 高（最优解） |
+| 主要风险 | 兜圈子 | 计划过时 | 反思误判死循环 | 计划错了无法调整 | 成本失控 |
+
+**选型口诀**：
+- 简单工具调用 → **ReAct**
+- 复杂多步任务 → **Plan-and-Execute**
+- 要高质量输出 → **Reflexion**
+- 要省 token、步骤确定 → **ReWOO**
+- 要搜索最优解 → **ToT**
+
+**混合是常态**：真实产品常常把几种拼起来，例如「Plan-and-Execute 打底 + Reflexion 兜质量」，或者「ReAct 处理交互 + Plan-and-Execute 处理长任务」。
+
+### 6.7 市面上哪些 Agent 用哪种模式
+
+| 产品 / 框架 | 采用的模式 | 原因 |
+|---|---|---|
+| **Claude Code**（Anthropic） | ReAct + Skill 懒加载 | 交互式编程，需要灵活的工具调用 |
+| **LangChain Agent Executor** | ReAct（默认） | 通用场景，最简单的循环 |
+| **OpenAI Assistants / Function Calling** | ReAct 循环 | 通用 API，简单可靠 |
+| **AutoGPT** | Plan-and-Execute 变体 | 自主长任务，需要先分解再执行 |
+| **Devin** | Plan-and-Execute + Reflexion | 复杂编程任务，需要规划 + 自我纠错 |
+| **Manus** | Plan-and-Execute | 复杂多步任务代理 |
+| **Cursor / Windsurf** | ReAct + MCP | 编程助手，以工具调用为主 |
+| **OpenAI o1 / o3** | 模型内置思维链（类 ToT） | 搜索在模型内部完成，不依赖外部框架 |
+| **你项目 `claude_agent`** | ReAct（手写 while 循环） | 和 `step1_agent.py` 是同一模式 |
+
+**趋势判断**：简单任务用 ReAct（够用、省 token），复杂任务用 Plan-and-Execute（减少偏航），高质量要求叠加 Reflexion（自我纠错），搜索最优解用 ToT（成本最高）。而这些「框架」在 LangGraph 里都只是**换一套图的连线方式**，核心的 LLM、工具、状态定义几乎不用改。
+
+---
+
+## 7. 对照篇：示例代码 vs 你现有的 `claude_agent` 项目
 
 学习最快的路径，是把你已经写过的项目和新学的框架对上。
 
@@ -662,20 +857,22 @@ async def main() -> None:
 | MCP | [mcp_client.py](file:///workspace/claude_agent/backend/app/core/mcp_client.py) 手写 stdio + JSON-RPC | 官方 `langchain-mcp-adapters` |
 | 权限确认 | [permissions.py](file:///workspace/claude_agent/backend/app/core/permissions.py) 高危操作用户确认 | 无（教学示例省略） |
 | 系统提示词 | [system.py](file:///workspace/claude_agent/backend/app/core/prompts/system.py) 分段拼装（工作区/摘要/RAG/技能） | 单段字符串 |
+| 规划模式 | ReAct（手写 `while` 循环） | ReAct + 另外 4 种框架示例 |
 
 **几点对照结论：**
 
 1. **你手写的 `mcp_client.py` 和官方适配器做的是同一件事**：起进程 + 收发 JSON-RPC。理解了这一点，你就知道那个文件里每一行在解决什么问题。
 2. **`build_system_prompt` 的多段拼装，本质就是 Skill 注入的加强版**：`fs_summary`、`compressed_summary`、`rag_context`、`skill_prompts` 全是往「系统提示词插槽」里塞内容，和 `prompt_of()` 是一个思路。
-3. **框架不替代工程**。权限、沙箱、上下文压缩、SSRF 防护这些东西，框架不给你，得自己写 —— 这正是下一章。
+3. **你项目的 Agent 用的是 ReAct 模式**：`agent.py` 里的 `while` 循环就是「想一步做一步」。如果未来任务变复杂（多步骤、易跑偏），可以参考第 6 章的 Plan-and-Execute 改造。
+4. **框架不替代工程**。权限、沙箱、上下文压缩、SSRF 防护这些东西，框架不给你，得自己写 —— 这正是下一章。
 
 ---
 
-## 7. 工程篇：把 demo 变成产品要补什么
+## 8. 工程篇：把 demo 变成产品要补什么
 
 最小示例跑通 ≠ 能用。下面这些是真实项目必须补的，每一项都对应你项目里已经踩过的坑。
 
-### 7.1 工具的显式参数 Schema（必补）
+### 8.1 工具的显式参数 Schema（必补）
 
 ```python
 from pydantic import BaseModel, Field
@@ -694,13 +891,13 @@ tool = StructuredTool.from_function(
 
 **当函数用 `**kwargs` 接收参数、或者注解不明确时，框架推断不出 schema，LLM 就会传错参数。** 显式声明 `args_schema` 是唯一稳妥的解法。
 
-### 7.2 权限确认（高危操作必须拦）
+### 8.2 权限确认（高危操作必须拦）
 
 `execute_command`、`web_fetch`、写文件这类操作，应该**在真正执行前中断，交给人确认**，而不是让 LLM 想干嘛就干嘛。
 
 LangGraph 的做法是 `interrupt()`：在执行前暂停图，等外部传入确认结果再继续。你项目里的 [permissions.py](file:///workspace/claude_agent/backend/app/core/permissions.py) 是自己实现的确认流，思路完全一致。
 
-### 7.3 沙箱隔离
+### 8.3 沙箱隔离
 
 ```python
 # claude_agent 的做法
@@ -709,7 +906,7 @@ sandbox / adapter.py, local.py, pool.py
 
 LLM 生成的代码必须跑在**受控环境**里：限定工作目录、限制网络、限制资源。绝不能直接在宿主进程里 `exec`。
 
-### 7.4 上下文管理（Agent 跑久了会爆）
+### 8.4 上下文管理（Agent 跑久了会爆）
 
 因为 LLM 是无状态的黑盒（见 1.5），每次调用都重新发全部历史。对话越长，消息越多，最终会超出模型的上下文窗口。**必须主动裁剪，框架不会自动帮你。**
 
@@ -721,33 +918,34 @@ LLM 生成的代码必须跑在**受控环境**里：限定工作目录、限制
 
 你项目的系统提示词里写了「大文件先写盘再处理」，就是这个意思——中间结果持久化到文件系统，避免上下文膨胀。
 
-### 7.5 RAG：把「知识」也做成工具
+### 8.5 RAG：把「知识」也做成工具
 
 和 Skill 同理 —— RAG 本质上就是往 system prompt 里注入检索到的片段（`rag_context`），或者做成一个 `search_documents` 工具。**它还是那两个插槽。**
 
-### 7.6 SSRF 防护
+### 8.6 SSRF 防护
 
 任何「让 LLM 指定 URL 去访问」的功能，都要**拒绝内网 IP**，否则会被诱导访问 `169.254.169.254` 这类元数据地址，导致凭据泄露。你项目的 `web_fetch` 已经做了这层校验。
 
-### 7.7 可观测性
+### 8.7 可观测性
 
 生产 Agent 必须能回答：「这一轮为什么调了这个工具？」「哪一步慢？」「哪一步失败？」
 LangSmith 可以自动 trace LangGraph 的执行；自研的话也要在节点里埋日志。
 
 ---
 
-## 8. 学习路径与练习
+## 9. 学习路径与练习
 
-### 8.1 推荐顺序
+### 9.1 推荐顺序
 
 1. **跑通 step1**，把系统提示词删掉一半，观察 Agent 行为怎么变。
 2. **加一个新工具**（比如「查天气」的假函数），看 LLM 是否会调用它。
 3. **跑通 step2**，自己写一个 Markdown 技能（比如「代码审查规范」），看命中时提示词怎么注入。
 4. **把关键词匹配换成语义匹配**（见下方练习）。
 5. **跑通 step3**，把 filesystem 换成另一个 MCP server（如 fetch、sqlite）。
-6. 最后：**把三步合成一个单文件 Agent**，同时具备基础工具 + Skill + MCP。
+6. **跑通四个规划框架**（[plan_and_execute.py](file:///workspace/claude_agent/learn-agent/plan_and_execute.py)、[reflexion.py](file:///workspace/claude_agent/learn-agent/reflexion.py)、[rewoo.py](file:///workspace/claude_agent/learn-agent/rewoo.py)、[tot.py](file:///workspace/claude_agent/learn-agent/tot.py)），对比同一个问题在不同框架下的执行路径和 token 消耗。
+7. 最后：**把三步合成一个单文件 Agent**，同时具备基础工具 + Skill + MCP + 可切换的规划框架。
 
-### 8.2 练习题（由浅入深）
+### 9.2 练习题（由浅入深）
 
 | 难度 | 练习 | 考察点 |
 |---|---|---|
@@ -756,54 +954,78 @@ LangSmith 可以自动 trace LangGraph 的执行；自研的话也要在节点�
 | 中 | 给 Agent 加一个「执行完工具后打印一句话」的节点 | 理解节点与边的串联 |
 | 中 | 用 embedding 替换 `_bigrams` 做 Skill 匹配 | 语义检索 |
 | 中 | 让 MCP 同时加载两个 server | `MultiServerMCPClient` 多服务 |
+| 中 | 给 [plan_and_execute.py](file:///workspace/claude_agent/learn-agent/plan_and_execute.py) 加一条「计划执行完补充新步骤」的边 | 条件边与循环 |
+| 中 | 把 ReAct 的图改成 ReWOO（一次规划批量执行），对比 LLM 调用次数 | 规划框架差异 |
 | 难 | 给 `execute_command` 加 interrupt 确认流 | LangGraph 中断与恢复 |
 | 难 | 加一个「上下文超长就摘要」的节点 | 状态管理与压缩 |
+| 难 | 组合 Plan-and-Execute + Reflexion，实现「先规划、执行、再自检」 | 框架混合 |
 
 ---
 
-## 9. 常见坑
+## 10. 常见坑
 
-### 9.1 工具没有参数 Schema
+### 10.1 工具没有参数 Schema
 
 **现象**：LLM 报「缺少位置参数」，或 `list_files` 永远返回空。
 **原因**：函数只有 `**kwargs` 或没有类型注解，schema 推断为空。
-**解法**：显式传 `args_schema`（见 7.1）。
+**解法**：显式传 `args_schema`（见 8.1）。
 
-### 9.2 忘记用 `add_messages`
+### 10.2 忘记用 `add_messages`
 
 **现象**：Agent 第二轮就「失忆」了。
 **原因**：`messages` 没标 `Annotated[..., add_messages]`，节点返回时把历史覆盖了。
 
-### 9.3 条件边函数写错方向
+### 10.3 条件边函数写错方向
 
 **现象**：Agent 无限循环，或者工具还没执行就结束了。
 **原因**：`tools_condition` 的语义是「有 tool_calls → tools，没有 → END」，别写反；回灌边要指向 `agent` 而不是 `END`。
 
-### 9.4 MCP 首次启动超时
+### 10.4 MCP 首次启动超时
 
 **现象**：`npx` 下载包太慢，连接被关闭。
 **原因**：第一次运行需要下载 server 包。
 **解法**：先手动跑一次把包装进缓存，再启动 Agent。
 
-### 9.5 中文技能匹配不灵敏
+### 10.5 Node.js 版本过低导致 MCP 起不来
+
+**现象**：跑 `step3_mcp.py` 时报 `Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'fs'`，接着 `McpError: Connection closed`。
+**原因**：MCP 官方 server 是 ESM 模块，要求 **Node.js ≥ 18**。低版本（如 Ubuntu 自带的 12.x）无法正确解析 ESM 内置模块导入，子进程一启动就崩。
+**解法**：升级 Node.js 到 20：
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
+```
+
+如果安装时和旧的 `libnode-dev` 冲突（`trying to overwrite '/usr/include/node/common.gypi'`），先卸旧包再装：
+
+```bash
+sudo apt-get remove -y libnode-dev nodejs
+sudo apt-get autoremove -y
+sudo apt-get install -y nodejs
+```
+
+跑之前记得清掉旧的 npx 缓存 `rm -rf ~/.npm/_npx`，并配国内镜像 `npm config set registry https://registry.npmmirror.com`。
+
+### 10.6 中文技能匹配不灵敏
 
 **现象**：说「转换」匹配不到「换算」技能。
 **原因**：关键词 / 二元组匹配只看字面重合。
-**解法**：换 embedding 语义匹配。
+**解法**：换 embedding 语义匹配，或改用 `step2_skills_llm.py` 的 LLM 匹配。
 
-### 9.6 API 配额
+### 10.7 API 配额
 
 **现象**：`403 Free quota exhausted`。
 **原因**：账号免费额度用尽，**不是代码问题**。
 **解法**：在模型服务控制台充值或关闭「仅使用免费额度」，然后更新 `.env` 里的 `OPENAI_API_KEY` / `OPENAI_BASE_URL`。
 
-### 9.7 模型能算对，就不想用工具了
+### 10.8 模型能算对，就不想用工具了
 
 **现象**：删掉 `calculate` 工具，模型照样能算出 90×87=7830，怀疑还需要工具吗。
 **原因**：现代模型通过训练数据学到了算术规律（模式匹配，不是运算）。简单算术能"猜"对，但这不可靠。
 **解法**：**该保留工具不是因为"模型不会算"，而是"无法保证每次都对"。** 工具是确定性的，模型是概率性的。Agent 的设计原则是：能用确定性工具解决的事，绝不交给概率模型猜。
 
-### 9.8 LLM 匹配 Skill 多了一轮调用
+### 10.9 LLM 匹配 Skill 多了一轮调用
 
 **现象**：用 `step2_skills_llm.py`（LLM 匹配版）时，Agent 会先调一次 `load_skill` 再回答，比代码匹配版多一轮。
 **原因**：LLM 需要先调用 `load_skill` 工具拉取技能正文，才知道该怎么回答。
@@ -821,7 +1043,13 @@ cp .env.example .env          # 填入你的 API Key
 python step1_agent.py "算一下 (12+8)*3，并查一下 langgraph 是什么"
 python step2_skills.py "把 100 公里换算成英里"        # 代码匹配版
 python step2_skills_llm.py "帮我写规范的 commit message"  # LLM 匹配版
-python step3_mcp.py            # 需要本机有 node / npx
+python step3_mcp.py            # 需要本机有 node / npx（Node ≥ 18）
+
+# 四种规划框架（对比同一类问题的不同处理方式）
+python plan_and_execute.py "帮我查一下 langgraph 是什么，然后算 (12+8)*3"
+python reflexion.py "算 (15+27)*3，再查一下 mcp 是什么"
+python rewoo.py "算 15*3 和 27*3，然后告诉我哪个更大"
+python tot.py "用 3 7 8 8 四个数，通过加减乘除得到 24"
 ```
 
 `requirements.txt`：
@@ -847,4 +1075,5 @@ python-dotenv>=1.0
 > 用 **两个插槽**（系统提示词 + 工具列表）扩展能力 ——
 > Skill 往插槽里塞知识和工具，MCP 往插槽里塞外部服务，
 > 匹配可以靠代码（快但漏）也可以靠 LLM（准但贵），
+> 规划框架（Plan-and-Execute / Reflexion / ReWOO / ToT）只是**换一套图的连线方式**，
 > 剩下的（权限、沙箱、压缩、安全）才是真正决定产品好坏的工程量。
