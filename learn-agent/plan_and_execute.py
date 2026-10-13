@@ -5,9 +5,11 @@ Plan-and-Execute 框架示例
 ReAct 是「走一步看一步」，Plan-and-Execute 是「先想好再批量做」。
 
 图结构：
-    START → [planner] → [executor] → [re-planner] → (需要改计划?) → [executor] ...
-                                          │
-                                          └─ 不需要 → END
+    START → [planner] → [executor] ──(有工具调用)──→ [tools] ──→ [replanner]
+                            ↑                                        │
+                            └────(还有剩余步骤)──────────────────────┤
+                                                                     │
+                                          (计划已完成) ───────────────┴──→ END
 
 适用场景：复杂多步任务，先规划能减少中途偏航。
 
@@ -105,6 +107,17 @@ def build_plan_and_execute():
         # 否则去 re-planner 审查
         return "replan"
 
+    def should_replan(state: PlanExecuteState) -> str:
+        """条件边：审查后还有剩余步骤就继续执行，否则结束。
+
+        这一步是必须的——replanner 会把 current_step 推进到 len(plan)
+        （判 DONE 时，或它补的新步骤为空时），如果此时还无条件回 executor，
+        就会访问 plan[current_step] 越界崩溃。
+        """
+        if state["current_step"] >= len(state["plan"]):
+            return END
+        return "executor"
+
     graph = StateGraph(PlanExecuteState)
     graph.add_node("planner", planner)
     graph.add_node("executor", executor)
@@ -119,7 +132,11 @@ def build_plan_and_execute():
         END: END,
     })
     graph.add_edge("tools", "replanner")  # 工具结果 → 审查
-    graph.add_edge("replanner", "executor")  # 审查完 → 执行下一步
+    # 审查完 → 有剩余步骤就执行下一步，否则结束（不能无条件回 executor）
+    graph.add_conditional_edges("replanner", should_replan, {
+        "executor": "executor",
+        END: END,
+    })
     return graph.compile()
 
 

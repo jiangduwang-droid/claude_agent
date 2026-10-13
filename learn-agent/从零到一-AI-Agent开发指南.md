@@ -688,35 +688,37 @@ ReAct 的特点是**走一步看一步**：每做一步都调一次 LLM 重新�
      └──────────┘
           │
           ▼
-     ┌──────────┐   有 tool_calls   ┌──────────┐
-     │ executor │ ────────────────► │  tools   │
-     └──────────┘                   └──────────┘
-          │                              │
+     ┌──────────┐  有 tool_calls   ┌──────────┐
+     │ executor │ ───────────────► │  tools   │
+     └──────────┘                  └──────────┘
           │ 无 tool_calls                │
           ▼                              │
      ┌──────────┐ ◄──────────────────────┘
      │replanner │  ② 审查结果：继续 / 改计划 / DONE
      └──────────┘
           │
-          ▼
-     ┌──────────┐
-     │ executor │  ③ 执行下一步（循环）
-     └──────────┘
+          ├─ 还有剩余步骤 → 回 executor（循环）
+          └─ 计划已完成  → END
 ```
 
-代码实现见 [plan_and_execute.py](file:///workspace/claude_agent/learn-agent/plan_and_execute.py)，核心是三个节点加一条循环边：
+代码实现见 [plan_and_execute.py](file:///workspace/claude_agent/learn-agent/plan_and_execute.py)，核心是三个节点加两条条件边：
 
 ```python
-graph.add_edge(START, "planner")          # 先规划
-graph.add_edge("planner", "executor")      # 再执行
+graph.add_edge(START, "planner")           # 先规划
+graph.add_edge("planner", "executor")       # 再执行
 graph.add_conditional_edges("executor", should_continue, {
     "tools": "tools",       # 需要工具 → 执行工具
     "replan": "replanner",  # 不需要工具 → 交给审查
     END: END,
 })
 graph.add_edge("tools", "replanner")
-graph.add_edge("replanner", "executor")    # 审查完 → 继续执行下一步
+graph.add_conditional_edges("replanner", should_replan, {   # ← 必须是条件边
+    "executor": "executor",  # 还有剩余步骤 → 继续执行
+    END: END,                # 计划已完成 → 结束
+})
 ```
+
+> **一个真实的坑（写这个示例时踩到的）**：`replanner → executor` 这条边**不能是无条件边**。因为 `replanner` 会把 `current_step` 推进到 `len(plan)`（判 DONE 时，或它补的新步骤为空时），此时若无条件回到 `executor`，`plan[current_step]` 就会越界，抛 `IndexError: list index out of range`。**凡是「循环回边」都要想清楚退出条件**——这是 Plan-and-Execute 和 Reflexion、ToT 都容易犯的错。
 
 **和 ReAct 的差别**：ReAct 的 `call_model` 节点既负责「想」也负责「决定要不要继续」；Plan-and-Execute 把「想」拆成两步——`planner`（定计划）和 `replanner`（改计划），中间夹着纯粹的 `executor`。
 
@@ -1030,6 +1032,23 @@ sudo apt-get install -y nodejs
 **现象**：用 `step2_skills_llm.py`（LLM 匹配版）时，Agent 会先调一次 `load_skill` 再回答，比代码匹配版多一轮。
 **原因**：LLM 需要先调用 `load_skill` 工具拉取技能正文，才知道该怎么回答。
 **解法**：这是正常的"懒加载"开销。Python 技能的工具已预先绑定（schema 很小），不需要走 `load_skill`；只有 Markdown 技能的正文才需要按需拉取。如果技能很少且描述很短，可以直接全部注入 system prompt，不走 `load_skill`。
+
+### 10.10 循环回边没有退出条件导致 IndexError
+
+**现象**：跑 `plan_and_execute.py` 时抛 `IndexError: list index out of range`，位置在 `executor` 的 `step = state["plan"][step_idx]`。
+**原因**：`replanner → executor` 写成了**无条件边**。`replanner` 会把 `current_step` 推进到 `len(plan)`（判 DONE 时，或补的新步骤为空时），此时无条件回到 `executor`，`plan[current_step]` 就越界了。
+**解法**：把循环回边改成**条件边**，明确退出条件：
+
+```python
+def should_replan(state: PlanExecuteState) -> str:
+    if state["current_step"] >= len(state["plan"]):
+        return END
+    return "executor"
+
+graph.add_conditional_edges("replanner", should_replan, {"executor": "executor", END: END})
+```
+
+**通用教训**：**凡是让控制流「绕回去」的边，都必须同时想清楚「什么时候不再绕」**。ReAct 靠 `tools_condition` 退出，Reflexion 靠 `MAX_RETRIES` 退出，ToT 靠 `MAX_DEPTH` 退出，Plan-and-Execute 靠「剩余步骤数归零」退出——一个都不能少。
 
 ---
 
