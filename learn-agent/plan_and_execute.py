@@ -13,8 +13,15 @@ ReAct 是「走一步看一步」，Plan-and-Execute 是「先想好再批量做
 
 适用场景：复杂多步任务，先规划能减少中途偏航。
 
-运行：
-    python plan_and_execute.py "帮我查一下 langgraph 是什么，然后算 (12+8)*3"
+注意：简单任务（两三步、彼此独立）用 ReAct 就够了，看不出本框架的价值。
+要体现 Plan-and-Execute，需要「多步 + 有依赖」的任务——后面的步骤要用到前面步骤的结果。
+
+运行（复杂任务）：
+    python plan_and_execute.py
+    python plan_and_execute.py "帮我规划一次 5 人 3 天的团建预算：先获取今天日期；\
+分别计算交通费（租中巴 800 元/天 × 3 天）、住宿费（酒店 300 元/间/晚，3 间 × 2 晚）、\
+餐饮费（餐标 150 元/人/天 × 5 人 × 3 天）、活动费（人均 200 元 × 5 人）；\
+再汇总所有费用得到总预算；最后按 5 人算人均花费，并判断总预算是否超过 12000 元。"
 """
 from __future__ import annotations
 
@@ -50,13 +57,14 @@ PLANNER_PROMPT = """你是一个任务规划器。用户给你一个任务，你
 每一步应该是一个具体动作，比如"调用 calculate 计算 xxx"或"调用 search_knowledge 查询 xxx"。
 输出格式：每行一个步骤，不要编号，不要额外解释。"""
 
-EXECUTOR_PROMPT = """你是一个执行器。你收到了一个任务步骤，请调用合适的工具来完成它。
-如果不需要工具，直接给出结果。回答用中文。"""
+EXECUTOR_PROMPT = """你是一个执行器。你会看到整体任务、已经完成的步骤及其工具结果，以及当前要执行的步骤。
+请结合已有的结果来完成当前步骤，需要计算或查询时必须调用对应的工具；不需要工具就直接给出结果。回答用中文。"""
 
-REPLANNER_PROMPT = """你是一个计划审查器。看看已执行的结果和剩余计划，判断：
-1. 如果计划已经完成，回复"DONE"
-2. 如果计划需要调整（比如结果不对、需要补充步骤），给出新的剩余步骤
-输出格式：如果完成就只回复 DONE，否则每行一个新步骤。"""
+REPLANNER_PROMPT = """你是一个计划审查器。你会看到整体任务、刚完成的步骤、该步骤的执行结果，以及剩余的待办步骤，判断：
+1. 如果整个任务已经完成，只回复 "DONE"
+2. 否则，给出【接下来还要执行】的步骤。只列尚未完成的步骤，不要把已完成的步骤再列一遍；
+   如果原计划需要调整（结果不对、需要补充步骤），直接给出修正后的剩余步骤。
+输出格式：完成则只回复 DONE；否则每行一个步骤，不要编号，不要额外解释。"""
 
 
 def build_plan_and_execute():
@@ -70,30 +78,49 @@ def build_plan_and_execute():
             HumanMessage(content=user_msg),
         ])
         steps = [s.strip() for s in response.content.strip().split("\n") if s.strip()]
-        return {"plan": steps, "current_step": 0}
+        # 兜底：万一规划器没产出步骤，就用原问题当唯一一步，避免 executor 空计划越界
+        return {"plan": steps or [user_msg], "current_step": 0}
 
     def executor(state: PlanExecuteState) -> dict:
-        """节点 2：执行当前步骤，可以调工具。"""
+        """节点 2：执行当前步骤，可以调工具。
+
+        关键：把 state["messages"]（前面所有步骤及其工具结果）一并带上，
+        执行器才能完成「有依赖」的步骤——例如最后一步「汇总前面各项费用」，
+        必须先看到前面几步算出的小计，否则无从汇总。
+        """
         step_idx = state["current_step"]
         step = state["plan"][step_idx]
         llm_with_tools = llm.bind_tools(TOOLS)
         response = llm_with_tools.invoke([
             SystemMessage(content=EXECUTOR_PROMPT),
+            *state["messages"],  # ← 历史上下文：依赖式步骤必需
             HumanMessage(content=f"请执行这个步骤：{step}"),
         ])
         return {"messages": [response]}
 
     def replanner(state: PlanExecuteState) -> dict:
         """节点 3：看结果，决定继续、改计划还是结束。"""
+        step_idx = state["current_step"]
+        done_step = state["plan"][step_idx]
         last_msg = state["messages"][-1]
+        remaining = state["plan"][step_idx + 1:]
         response = llm.invoke([
             SystemMessage(content=REPLANNER_PROMPT),
-            HumanMessage(content=f"已执行的步骤结果：{last_msg.content}\n\n剩余计划：{state['plan'][state['current_step']+1:]}"),
+            HumanMessage(content=(
+                f"整体任务：{state['messages'][0].content}\n\n"
+                f"刚完成的步骤：{done_step}\n"
+                f"该步骤的结果：{last_msg.content}\n\n"
+                f"原本剩余的步骤：{remaining}"
+            )),
         ])
         if response.content.strip().upper() == "DONE":
-            return {"current_step": len(state["plan"])}  # 标记完成
+            return {"current_step": len(state["plan"])}  # 标记完成 → should_replan 会走 END
         new_steps = [s.strip() for s in response.content.strip().split("\n") if s.strip()]
-        return {"plan": state["plan"][:state["current_step"]+1] + new_steps, "current_step": state["current_step"] + 1}
+        # 保留已完成的步骤 + 审查器给出的剩余步骤，使 plan[current_step] 始终指向「下一步」
+        return {
+            "plan": state["plan"][:step_idx + 1] + new_steps,
+            "current_step": step_idx + 1,
+        }
 
     def should_continue(state: PlanExecuteState) -> str:
         """条件边：判断下一步去哪。"""
@@ -140,8 +167,17 @@ def build_plan_and_execute():
     return graph.compile()
 
 
+COMPLEX_TASK = (
+    "帮我规划一次 5 人、3 天的北京团建预算：先获取今天的日期；"
+    "然后分别计算交通费（租中巴 800 元/天 × 3 天）、"
+    "住宿费（酒店 300 元/间/晚，5 人需 3 间 × 2 晚）、"
+    "餐饮费（餐标 150 元/人/天 × 5 人 × 3 天）、活动费（人均 200 元 × 5 人）；"
+    "再汇总所有费用得到总预算；最后按 5 人计算人均花费，并判断总预算是否超过 12000 元。"
+)
+
+
 def main():
-    question = " ".join(sys.argv[1:]) or "帮我查一下 langgraph 是什么，然后算 (12+8)*3"
+    question = " ".join(sys.argv[1:]) or COMPLEX_TASK
     app = build_plan_and_execute()
 
     print(f"\n用户> {question}\n")
@@ -160,8 +196,15 @@ def main():
                     elif msg.content:
                         print(f"  [结果] {str(msg.content)[:200]}")
             elif node == "replanner":
+                # replanner 返回的是「已完成 + 剩余」的完整 plan，这里只打印尚未执行的剩余步骤
                 if "plan" in update:
-                    print(f"  [审查] 剩余步骤: {update.get('plan', [])}")
+                    plan = update["plan"]
+                    cur = update.get("current_step", 0)
+                    remaining = plan[cur:]
+                    if remaining:
+                        print(f"  [审查] 还剩 {len(remaining)} 步: {remaining}")
+                    else:
+                        print("  [审查] 计划已完成")
             elif node == "tools":
                 for msg in update.get("messages", []):
                     print(f"  [工具返回] {str(msg.content)[:200]}")
