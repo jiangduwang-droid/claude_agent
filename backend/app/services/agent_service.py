@@ -294,15 +294,12 @@ class AgentService:
             all_tool_calls: list = []
 
             async for event in stream_agent_response(
-                agent_components["bound_llm"],
+                agent_components["graph"],
                 messages,
-                agent_components.get("tool_node"),
-                agent_components.get("tool_map", {}),
                 max_steps=self._config.max_steps,
                 doom_loop_threshold=self._config.doom_loop_threshold,
                 headroom=self._headroom,
                 abort_event=abort_event,
-                permission_manager=permission_manager,
                 on_step_start=lambda step, max_s: _async_sse("start_step", step=step, max_steps=max_s),
                 on_text_delta=lambda delta: _async_sse("text_delta", content=delta),
                 on_tool_call_progress=lambda chunk: _async_sse(

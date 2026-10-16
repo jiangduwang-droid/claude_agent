@@ -40,7 +40,7 @@ cloud-claude-agent/
 │   │   │   ├── settings.py         # LLM 配置
 │   │   │   └── admin.py             # 管理后台
 │   │   ├── core/
-│   │   │   ├── agent.py             # Agent 组件工厂 + 沙箱代理 ★
+│   │   │   ├── agent.py             # LangGraph 状态图(agent/tools 节点) + 沙箱代理 ★
 │   │   │   ├── auth.py              # JWT 认证
 │   │   │   ├── event_bus.py         # 事件总线
 │   │   │   ├── headroom_service.py  # 实时压缩 + CCR

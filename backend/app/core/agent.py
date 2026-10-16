@@ -3,9 +3,8 @@ import contextvars
 import hashlib
 import json
 import time
-from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, AsyncGenerator, TypedDict
 
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
@@ -13,8 +12,7 @@ from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.config import Config
-from app.core.headroom_service import HeadroomService, emergency_compact, trim_to_turn_boundary
-from app.core.permissions import PermissionManager
+from app.core.headroom_service import HeadroomService, emergency_compact
 
 current_conversation_id: contextvars.ContextVar[str] = contextvars.ContextVar("conversation_id", default="")
 current_sandbox_adapter: contextvars.ContextVar[Any] = contextvars.ContextVar("sandbox_adapter", default=None)
@@ -38,38 +36,63 @@ def classify_error(error: Exception) -> ErrorCategory:
     return ErrorCategory.RETRYABLE
 
 
-def _runtime_config() -> dict:
-    """构建 ToolNode 独立调用所需的 Runtime 配置。
+try:
+    from langgraph.config import get_stream_writer
+except Exception:  # pragma: no cover - 兼容不支持 custom stream 的旧版 langgraph
+    def get_stream_writer():  # type: ignore[misc]
+        return lambda *_args, **_kwargs: None
 
-    langgraph-prebuilt 的 ToolNode 要求运行时注入 Runtime,脱离图直接调用时必须手动提供。
+
+class AgentState(TypedDict, total=False):
+    """LangGraph 状态图的共享状态。
+
+    这里刻意不使用 ``add_messages`` reducer(即"整体覆盖"语义),这样节点可以
+    自由地增删、压缩消息列表,同时携带跨节点累计的 token 用量、文本、工具调用等指标。
+    """
+
+    messages: list
+    step: int
+    max_steps: int
+    doom_loop_threshold: int
+    headroom: Any
+    abort_event: Any
+    usage: dict
+    last_prompt_tokens: int
+    text_parts: list
+    tool_calls: list
+    allowed_tool_calls: list
+    call_history: list
+    status: str
+
+
+def _write(event: dict) -> None:
+    """向当前节点所属的 LangGraph 流写入自定义事件(custom stream mode)。
+
+    只在节点内部调用才有效;节点外调用会被安全地降级为空操作。
     """
     try:
-        from langgraph._internal._constants import CONF, CONFIG_KEY_RUNTIME
-        from langgraph.runtime import Runtime
+        writer = get_stream_writer()
+        writer(event)
     except Exception:
-        try:
-            from langgraph.constants import CONF, CONFIG_KEY_RUNTIME
-            from langgraph.runtime import Runtime
-        except Exception:
-            return {}
-    return {CONF: {CONFIG_KEY_RUNTIME: Runtime()}}
+        return
 
 
-@dataclass
-class StepTracker:
-    max_steps: int = 25
-    doom_loop_threshold: int = 3
-    _call_history: list[str] = field(default_factory=list)
+def _call_key(tool_name: str, args: dict) -> str:
+    args_str = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+    return f"{tool_name}:{hashlib.sha256(args_str.encode()).hexdigest()[:12]}"
 
-    def check_doom_loop(self, tool_name: str, args: dict) -> bool:
-        args_str = json.dumps(args, sort_keys=True, ensure_ascii=False)
-        call_key = f"{tool_name}:{hashlib.sha256(args_str.encode()).hexdigest()[:12]}"
-        self._call_history.append(call_key)
-        if len(self._call_history) > self.doom_loop_threshold:
-            self._call_history = self._call_history[-self.doom_loop_threshold:]
-        if len(self._call_history) >= self.doom_loop_threshold:
-            return len(set(self._call_history)) == 1
-        return False
+
+def _is_doom_loop(history: list, tool_name: str, args: dict, threshold: int) -> bool:
+    """把本次调用加入历史,并判断是否连续 threshold 次完全相同的调用。
+
+    语义与旧版 StepTracker.check_doom_loop 保持一致。
+    """
+    history.append(_call_key(tool_name, args))
+    if len(history) > threshold:
+        del history[: len(history) - threshold]
+    if len(history) >= threshold:
+        return len(set(history)) == 1
+    return False
 
 
 class RetryableError(Exception):
@@ -133,6 +156,208 @@ async def _llm_invoke_with_retry(llm, messages, **kwargs):
     return await llm.ainvoke(messages, **kwargs)
 
 
+def build_agent_graph(bound_llm, tool_map: dict, cfg: Config):
+    """把 ReAct 循环构建成一张 LangGraph 状态图。
+
+    图的拓扑:
+
+        START → agent ──(有可执行工具调用)──▶ tools ──┐
+                  │                                   │
+                  └─(无工具调用 / 被拦截 / 取消 / 超步)──▶ END
+                  ▲                                   │
+                  └───────────────────────────────────┘
+
+    - ``agent`` 节点: 流式调用 LLM,产出文本增量、工具调用进度,并做死循环检测、
+      权限确认与工具调用过滤,决定下一步走向。
+    - ``tools`` 节点: 执行被放行的工具调用,回填 ``ToolMessage``,再回到 agent。
+
+    节点通过 ``_write`` 把过程信息写入 custom stream,由外层
+    ``stream_agent_response`` 翻译成前端既有的 SSE 事件,因此事件契约保持不变。
+    """
+
+    async def call_model(state: AgentState) -> dict:
+        abort_event = state.get("abort_event")
+        if abort_event is not None and abort_event.is_set():
+            return {"status": "aborted"}
+
+        step = state.get("step", 0) + 1
+        max_steps = state.get("max_steps", 25)
+        if step > max_steps:
+            return {"status": "step_limit"}
+
+        _write({"kind": "step_start", "step": step, "max_steps": max_steps})
+
+        messages = list(state.get("messages") or [])
+        headroom = state.get("headroom")
+        if headroom:
+            messages = headroom.compress_messages(messages)
+
+        usage = dict(state.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+        last_prompt_tokens = state.get("last_prompt_tokens", 0)
+        text_parts = list(state.get("text_parts") or [])
+
+        # ---- 流式调用 LLM,带上下文溢出压缩与可重试错误重试 ----
+        while True:
+            full_response = None
+            try:
+                async for chunk in bound_llm.astream(messages):
+                    if abort_event is not None and abort_event.is_set():
+                        return {"status": "aborted"}
+
+                    if chunk.content:
+                        if isinstance(chunk.content, str):
+                            text_parts.append(chunk.content)
+                        _write({"kind": "text_delta", "content": chunk.content})
+
+                    tool_call_chunks = getattr(chunk, "tool_call_chunks", None)
+                    if tool_call_chunks:
+                        for tc_chunk in tool_call_chunks:
+                            _write({"kind": "tool_call_progress", "chunk": tc_chunk})
+
+                    meta = getattr(chunk, "usage_metadata", None)
+                    if meta:
+                        usage["prompt_tokens"] += meta.get("input_tokens", 0)
+                        usage["completion_tokens"] += meta.get("output_tokens", 0)
+                        usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+                        last_prompt_tokens = meta.get("input_tokens", last_prompt_tokens)
+
+                    full_response = chunk if full_response is None else full_response + chunk
+                break
+            except Exception as e:
+                category = classify_error(e)
+                if category == ErrorCategory.CONTEXT_OVERFLOW:
+                    messages = emergency_compact(
+                        messages, cfg.headroom_config.get("emergency_keep_messages", 12)
+                    )
+                    _write({"kind": "error",
+                            "error": f"Context overflow, compressed messages, retrying step {step}"})
+                    continue
+                if category == ErrorCategory.RETRYABLE:
+                    try:
+                        full_response = await _llm_invoke_with_retry(bound_llm, messages)
+                        break
+                    except Exception as retry_err:
+                        _write({"kind": "error", "error": str(retry_err)})
+                        return {"status": "error"}
+                _write({"kind": "error", "error": str(e)})
+                return {"status": "error"}
+
+        _write({"kind": "step_finish", "step": step})
+
+        if full_response is None:
+            _write({"kind": "error", "error": "Empty response from LLM"})
+            return {"status": "error"}
+
+        messages.append(full_response)
+        raw_tool_calls = list(getattr(full_response, "tool_calls", None) or [])
+        all_tool_calls = list(state.get("tool_calls") or [])
+        all_tool_calls.extend(raw_tool_calls)
+
+        call_history = list(state.get("call_history") or [])
+        update: dict = {
+            "messages": messages,
+            "step": step,
+            "usage": usage,
+            "last_prompt_tokens": last_prompt_tokens,
+            "text_parts": text_parts,
+            "tool_calls": all_tool_calls,
+            "call_history": call_history,
+            "allowed_tool_calls": [],
+            "status": "done",
+        }
+
+        if not raw_tool_calls:
+            return update
+
+        # ---- 死循环检测 + 权限确认,过滤出真正需要执行的工具调用 ----
+        permission_manager = current_permission_manager.get()
+        conversation_id = current_conversation_id.get()
+        threshold = state.get("doom_loop_threshold", 3)
+        allowed: list = []
+        dropped: list[ToolMessage] = []
+
+        for tc in raw_tool_calls:
+            name = tc.get("name", "")
+            args = tc.get("args", {}) or {}
+            tool_call_id = tc.get("id", "")
+
+            if _is_doom_loop(call_history, name, args, threshold):
+                _write({"kind": "doom_loop", "tool_name": name})
+                dropped.append(ToolMessage(
+                    content=f"Skipped: repeated identical call to '{name}' (doom loop detected).",
+                    tool_call_id=tool_call_id,
+                ))
+                continue
+
+            if permission_manager is not None and permission_manager.needs_confirmation(name, conversation_id):
+                _write({"kind": "confirm_request", "tool_call": tc})
+                approved = False
+                if tool_call_id:
+                    approved = await permission_manager.wait_for_confirmation(
+                        tool_call_id, timeout=cfg.agent_confirm_timeout
+                    )
+                if not approved:
+                    dropped.append(ToolMessage(
+                        content=f"User denied execution of tool '{name}'.",
+                        tool_call_id=tool_call_id,
+                    ))
+                    continue
+
+            allowed.append(tc)
+
+        if not allowed:
+            return update
+
+        # 被拦截的调用仍需回填 ToolMessage,保证 assistant.tool_calls 与结果一一对应
+        messages.extend(dropped)
+        update["allowed_tool_calls"] = allowed
+        update["status"] = "running"
+        return update
+
+    async def run_tools(state: AgentState) -> dict:
+        abort_event = state.get("abort_event")
+        messages = list(state.get("messages") or [])
+
+        for tc in state.get("allowed_tool_calls") or []:
+            if abort_event is not None and abort_event.is_set():
+                return {"status": "aborted"}
+
+            name = tc.get("name", "")
+            args = tc.get("args", {}) or {}
+            tool_call_id = tc.get("id", "")
+            tool = tool_map.get(name)
+
+            if tool is None:
+                content = f"Error: tool '{name}' is not available"
+            else:
+                try:
+                    result = await tool.ainvoke(args)
+                    content = result if isinstance(result, str) else str(result)
+                except Exception as e:
+                    content = f"Error in {name}: {e}"
+
+            tool_message = ToolMessage(content=content, tool_call_id=tool_call_id, name=name or None)
+            messages.append(tool_message)
+            _write({"kind": "tool_result", "message": tool_message})
+
+        return {"messages": messages, "allowed_tool_calls": [], "status": "running"}
+
+    def route_after_agent(state: AgentState) -> str:
+        if state.get("status") == "running" and state.get("allowed_tool_calls"):
+            return "tools"
+        return END
+
+    from langgraph.graph import END, StateGraph
+
+    graph = StateGraph(AgentState)
+    graph.add_node("agent", call_model)
+    graph.add_node("tools", run_tools)
+    graph.set_entry_point("agent")
+    graph.add_conditional_edges("agent", route_after_agent, {"tools": "tools", END: END})
+    graph.add_edge("tools", "agent")
+    return graph.compile()
+
+
 def create_claude_agent(sandbox_pool=None, skills=None, checkpointer=None, config=None) -> dict:
     cfg = config or Config.get()
 
@@ -142,23 +367,19 @@ def create_claude_agent(sandbox_pool=None, skills=None, checkpointer=None, confi
     tool_map: dict[str, Any] = {}
 
     if sandbox_pool:
-        sandbox_tools = _create_sandbox_tools()
-        for t in sandbox_tools:
+        for t in _create_sandbox_tools():
             all_tools.append(t)
             tool_map[t.name] = t
 
-    local_tools = _create_local_tools()
-    for t in local_tools:
+    for t in _create_local_tools():
         all_tools.append(t)
         tool_map[t.name] = t
 
-    lsp_tools = _create_lsp_tools()
-    for t in lsp_tools:
+    for t in _create_lsp_tools():
         all_tools.append(t)
         tool_map[t.name] = t
 
-    web_tools = _create_web_tools()
-    for t in web_tools:
+    for t in _create_web_tools():
         all_tools.append(t)
         tool_map[t.name] = t
 
@@ -170,15 +391,10 @@ def create_claude_agent(sandbox_pool=None, skills=None, checkpointer=None, confi
 
     bound_llm = llm.bind_tools(all_tools) if all_tools else llm
 
-    from langgraph.prebuilt import ToolNode
-    tool_node = ToolNode(all_tools) if all_tools else None
-
     return {
-        "bound_llm": bound_llm,
-        "tool_node": tool_node,
+        "graph": build_agent_graph(bound_llm, tool_map, cfg),
         "tool_map": tool_map,
         "all_tools": all_tools,
-        "__llm_invoke_retry": _llm_invoke_with_retry,
     }
 
 
@@ -448,11 +664,39 @@ def _create_web_tools() -> list[BaseTool]:
     ]
 
 
+async def _translate_event(event: dict, callbacks: dict) -> AsyncGenerator:
+    """把图内写的 custom 事件翻译成一次回调调用,并透传回调产出的 SSE 字符串。"""
+    kind = event.get("kind")
+    handler = callbacks.get(kind)
+    if handler is None:
+        return
+
+    if kind == "step_start":
+        out = await handler(event.get("step"), event.get("max_steps"))
+    elif kind == "text_delta":
+        out = await handler(event.get("content"))
+    elif kind == "tool_call_progress":
+        out = await handler(event.get("chunk"))
+    elif kind == "tool_result":
+        out = await handler(event.get("message"))
+    elif kind == "step_finish":
+        out = await handler(event.get("step"))
+    elif kind == "error":
+        out = await handler(event.get("error"))
+    elif kind == "doom_loop":
+        out = await handler(event.get("tool_name"))
+    elif kind == "confirm_request":
+        out = await handler(event.get("tool_call"))
+    else:
+        return
+
+    if out is not None:
+        yield out
+
+
 async def stream_agent_response(
-    bound_llm,
+    graph,
     messages: list[BaseMessage],
-    tool_node,
-    tool_map: dict,
     max_steps: int = 25,
     doom_loop_threshold: int = 3,
     headroom: HeadroomService | None = None,
@@ -465,172 +709,88 @@ async def stream_agent_response(
     on_error=None,
     on_doom_loop=None,
     on_confirm_request=None,
-    permission_manager: PermissionManager | None = None,
 ):
-    config = Config.get()
-    step = 0
-    step_tracker = StepTracker(max_steps=max_steps, doom_loop_threshold=doom_loop_threshold)
-    cumulative_usage = {"prompt_tokens": 0, "completion_tokens":  0, "total_tokens": 0}
-    last_prompt_tokens = 0
-    text_parts: list[str] = []
-    all_tool_calls: list = []
+    """驱动 LangGraph Agent 图,把图内的 custom 事件翻译为既有 SSE 事件流。
 
-    while step < max_steps:
-        if abort_event and abort_event.is_set():
-            yield {"type": "aborted"}
-            return
+    与旧实现相比:
+    - 不再手写 ReAct while 循环,循环控制完全交给图的节点与条件边;
+    - 通过 ``stream_mode=["custom", "values"]`` 同时拿到实时事件与最终状态;
+    - 每次请求的 max_steps / abort_event / headroom 作为初始状态注入,图实例可复用。
+    """
+    callbacks = {
+        "step_start": on_step_start,
+        "text_delta": on_text_delta,
+        "tool_call_progress": on_tool_call_progress,
+        "tool_result": on_tool_result,
+        "step_finish": on_step_finish,
+        "error": on_error,
+        "doom_loop": on_doom_loop,
+        "confirm_request": on_confirm_request,
+    }
 
-        step += 1
-        if on_step_start:
-            yield await on_step_start(step, max_steps)
+    initial: AgentState = {
+        "messages": list(messages),
+        "step": 0,
+        "max_steps": max_steps,
+        "doom_loop_threshold": doom_loop_threshold,
+        "headroom": headroom,
+        "abort_event": abort_event,
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "last_prompt_tokens": 0,
+        "text_parts": [],
+        "tool_calls": [],
+        "allowed_tool_calls": [],
+        "call_history": [],
+        "status": "running",
+    }
 
-        if headroom:
-            messages = headroom.compress_messages(messages)
-
-        try:
-            full_response = None
-            tool_call_chunks: list = []
-
-            async for chunk in bound_llm.astream(messages):
-                if abort_event and abort_event.is_set():
-                    yield {"type": "aborted"}
-                    return
-
-                if chunk.content:
-                    if isinstance(chunk.content, str):
-                        text_parts.append(chunk.content)
-                    if on_text_delta:
-                        yield await on_text_delta(chunk.content)
-
-                if hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
-                    tool_call_chunks.extend(chunk.tool_call_chunks)
-                    if on_tool_call_progress:
-                        for tc_chunk in chunk.tool_call_chunks:
-                            yield await on_tool_call_progress(tc_chunk)
-
-                if hasattr(chunk, "usage_metadata") and chunk.usage_metadata:
-                    cumulative_usage["prompt_tokens"] += chunk.usage_metadata.get("input_tokens", 0)
-                    cumulative_usage["completion_tokens"] += chunk.usage_metadata.get("output_tokens", 0)
-                    cumulative_usage["total_tokens"] = cumulative_usage["prompt_tokens"] + cumulative_usage["completion_tokens"]
-                    last_prompt_tokens = chunk.usage_metadata.get("input_tokens", last_prompt_tokens)
-
-                if full_response is None:
-                    full_response = chunk
-                else:
-                    full_response = full_response + chunk
-
-        except Exception as e:
-            category = classify_error(e)
-            if category == ErrorCategory.CONTEXT_OVERFLOW:
-                messages = emergency_compact(messages, config.headroom_config.get("emergency_keep_messages", 12))
-                if on_error:
-                    yield await on_error(f"Context overflow, compressed messages, retrying step {step}")
-                continue
-            elif category == ErrorCategory.RETRYABLE:
-                try:
-                    full_response = await _llm_invoke_with_retry(bound_llm, messages)
-                except Exception as retry_err:
-                    if on_error:
-                        yield await on_error(str(retry_err))
-                    return
+    final_state: dict = initial
+    try:
+        async for item in graph.astream(initial, stream_mode=["custom", "values"]):
+            if isinstance(item, tuple) and len(item) == 2:
+                _, chunk = item
             else:
-                if on_error:
-                    yield await on_error(str(e))
-                return
+                chunk = item
 
-        if on_step_finish:
-            yield await on_step_finish(step)
+            if isinstance(chunk, dict) and "kind" in chunk:
+                async for sse in _translate_event(chunk, callbacks):
+                    yield sse
+            elif isinstance(chunk, dict):
+                final_state = chunk
 
-        if full_response is None:
-            if on_error:
-                yield await on_error("Empty response from LLM")
-            return
+            if abort_event is not None and abort_event.is_set():
+                break
+    except Exception as e:
+        if on_error:
+            yield await on_error(str(e))
+        return
 
-        messages.append(full_response)
+    usage = final_state.get("usage") or {}
+    last_prompt_tokens = final_state.get("last_prompt_tokens", 0)
+    status = final_state.get("status", "done")
 
-        tool_calls = getattr(full_response, "tool_calls", None)
-        if tool_calls:
-            all_tool_calls.extend(tool_calls)
+    if status == "aborted" or (abort_event is not None and abort_event.is_set()):
+        yield {"type": "aborted"}
+        return
 
-        if not tool_calls:
-            yield {
-                "type": "done",
-                "usage": cumulative_usage,
-                "cumulative_usage": cumulative_usage,
-                "context_tokens": last_prompt_tokens,
-                "compression_pending": last_prompt_tokens > 128000 * 0.7,
-                "full_text": "".join(text_parts),
-                "tool_calls": all_tool_calls,
-            }
-            return
+    if status == "error":
+        return
 
-        filtered_tool_calls = []
-        dropped_tool_messages: list[ToolMessage] = []
-        for tc in tool_calls:
-            tool_name = tc.get("name", "")
-            args = tc.get("args", {})
-            tool_call_id = tc.get("id", "")
-
-            if step_tracker.check_doom_loop(tool_name, args):
-                if on_doom_loop:
-                    yield await on_doom_loop(tool_name)
-                dropped_tool_messages.append(ToolMessage(
-                    content=f"Skipped: repeated identical call to '{tool_name}' (doom loop detected).",
-                    tool_call_id=tool_call_id,
-                ))
-                continue
-
-            if permission_manager:
-                conv_id = current_conversation_id.get()
-                if permission_manager.needs_confirmation(tool_name, conv_id):
-                    if on_confirm_request:
-                        yield await on_confirm_request(tc)
-                    approved = False
-                    if tool_call_id:
-                        approved = await permission_manager.wait_for_confirmation(
-                            tool_call_id, timeout=config.agent_confirm_timeout
-                        )
-                    if not approved:
-                        dropped_tool_messages.append(ToolMessage(
-                            content=f"User denied execution of tool '{tool_name}'.",
-                            tool_call_id=tool_call_id,
-                        ))
-                        continue
-
-            filtered_tool_calls.append(tc)
-
-        if not filtered_tool_calls:
-            yield {
-                "type": "done",
-                "usage": cumulative_usage,
-                "cumulative_usage": cumulative_usage,
-                "context_tokens": last_prompt_tokens,
-                "compression_pending": False,
-                "full_text": "".join(text_parts),
-                "tool_calls": all_tool_calls,
-            }
-            return
-
-        if tool_node:
-            raw = await tool_node.ainvoke(
-                filtered_tool_calls, config=_runtime_config()
-            )
-            if isinstance(raw, dict) and "messages" in raw:
-                tool_messages = raw["messages"]
-            elif isinstance(raw, list):
-                tool_messages = raw
-            else:
-                tool_messages = [raw]
-            for tm in tool_messages:
-                messages.append(tm)
-                if on_tool_result:
-                    yield await on_tool_result(tm)
-        for tm in dropped_tool_messages:
-            messages.append(tm)
+    if status == "step_limit":
+        yield {
+            "type": "step_limit_reached",
+            "usage": usage,
+            "cumulative_usage": usage,
+            "context_tokens": last_prompt_tokens,
+        }
+        return
 
     yield {
-        "type": "step_limit_reached",
-        "usage": cumulative_usage,
-        "cumulative_usage": cumulative_usage,
+        "type": "done",
+        "usage": usage,
+        "cumulative_usage": usage,
         "context_tokens": last_prompt_tokens,
+        "compression_pending": last_prompt_tokens > 128000 * 0.7,
+        "full_text": "".join(final_state.get("text_parts") or []),
+        "tool_calls": final_state.get("tool_calls") or [],
     }
