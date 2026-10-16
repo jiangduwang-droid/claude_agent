@@ -343,19 +343,32 @@ class AgentRuntimeMiddleware(AgentMiddleware):
 
         permission_manager = current_permission_manager.get()
         conversation_id = current_conversation_id.get()
-        if permission_manager is not None and permission_manager.needs_confirmation(name, conversation_id):
-            _emit({"kind": "confirm_request", "tool_call": tool_call})
-            approved = False
-            if tool_call_id:
-                approved = await permission_manager.wait_for_confirmation(
-                    tool_call_id, timeout=self._config.agent_confirm_timeout
-                )
-            if not approved:
+        if permission_manager is not None:
+            # 权限校验集中到切面(对齐项目二 §4.4/§5.6「集中权限管控」):
+            # allow / deny / 路径边界在工具执行前统一判定,deny 直接短路返回,
+            # 不再下放到各个工具内部。
+            decision = permission_manager.can_use(name, conversation_id, args)
+            if not decision.allowed:
+                _emit({"kind": "permission_denied", "tool_name": name, "reason": decision.reason})
                 return ToolMessage(
-                    content=f"User denied execution of tool '{name}'.",
+                    content=f"Blocked by permission policy: {decision.reason}",
                     tool_call_id=tool_call_id,
                     name=name or None,
                 )
+
+            if permission_manager.needs_confirmation(name, conversation_id):
+                _emit({"kind": "confirm_request", "tool_call": tool_call})
+                approved = False
+                if tool_call_id:
+                    approved = await permission_manager.wait_for_confirmation(
+                        tool_call_id, timeout=self._config.agent_confirm_timeout
+                    )
+                if not approved:
+                    return ToolMessage(
+                        content=f"User denied execution of tool '{name}'.",
+                        tool_call_id=tool_call_id,
+                        name=name or None,
+                    )
 
         result = await handler(request)
         _emit({"kind": "tool_result", "message": result})
