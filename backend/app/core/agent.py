@@ -1,19 +1,3 @@
-"""Agent 装配与流式事件翻译。
-
-对齐技术文档《AI Agent 系统构建实践技术文档》第 4 章「项目二：带文件系统与代码沙箱的
-Agent 系统」:
-
-- 用 ``create_agent`` 构建 ReAct Agent(循环、工具执行、状态流转交给框架);
-- 沙箱工具与动态提示词由 :class:`SandboxMiddleware` 在 ``awrap_model_call`` 切面集中注入,
-  业务 Agent 无需感知;
-- ``thread_id → sandbox_id`` 的映射在工具内部完成:工具用框架注入的 ``ToolRuntime`` 取
-  ``thread_id``,再向 :class:`SandboxPoolManager` 换取 ``sandbox_id``,因此 ``sandbox_id``
-  对模型完全不可见。
-
-``stream_agent_response`` 只负责把图内写的 custom 事件与模型流式增量翻译成前端既有的
-SSE 事件契约,不参与 ReAct 循环控制。
-"""
-
 import asyncio
 import contextvars
 from typing import Any, AsyncGenerator
@@ -23,6 +7,8 @@ from langchain.tools import ToolRuntime
 from langchain_core.messages import (
     AIMessageChunk,
     BaseMessage,
+    HumanMessage,
+    ToolMessage,
 )
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
@@ -33,9 +19,8 @@ from app.core.sandbox_middleware import (
     SandboxMiddleware,
     build_middleware_stack,
 )
+from app.core.evolution.trajectory import ToolCallRecord, Trajectory
 
-# 这些 contextvar 由 AgentService 在一次对话请求开始时设置,供 Middleware 横切读取;
-# 工具侧则优先使用框架注入的 ToolRuntime(见项目二 §4.3)。
 current_conversation_id: contextvars.ContextVar[str] = contextvars.ContextVar("conversation_id", default="")
 current_permission_manager: contextvars.ContextVar[Any] = contextvars.ContextVar("permission_manager", default=None)
 current_abort_event: contextvars.ContextVar[Any] = contextvars.ContextVar("abort_event", default=None)
@@ -88,12 +73,7 @@ def _get_llm(config: Config):
         )
 
 
-# ---------------------------------------------------------------------------
-# 沙箱工具:签名里只有业务参数(绝不含 sandbox_id),thread_id 由 ToolRuntime 注入
-# ---------------------------------------------------------------------------
-
 def _thread_id_from_runtime(runtime: Any) -> str:
-    """从框架注入的 ToolRuntime 取 thread_id —— 映射的输入就来自这里(§4.3)。"""
     try:
         tid = runtime.config.get("configurable", {}).get("thread_id")
     except Exception:
@@ -104,12 +84,6 @@ def _thread_id_from_runtime(runtime: Any) -> str:
 
 
 def _make_sandbox_tool(pool: Any, tool_name: str, tool_timeout: int = 60) -> BaseTool:
-    """构造一个沙箱工具。
-
-    Agent 侧只看到业务参数(如 ``path`` / ``code``),``sandbox_id`` 不在 schema 里;
-    工具内部用 ``runtime`` 里的 thread_id 向沙箱池换取 adapter —— 映射由框架完成。
-    """
-
     async def _run(runtime: ToolRuntime, **kwargs) -> str:
         thread_id = _thread_id_from_runtime(runtime)
         try:
@@ -137,12 +111,6 @@ def _make_sandbox_tool(pool: Any, tool_name: str, tool_timeout: int = 60) -> Bas
 
 
 def _make_prepare_sandbox_tool(pool: Any) -> BaseTool:
-    """``prepare_sandbox`` —— 触发沙箱懒创建的基础设施工具。
-
-    该工具在沙箱未就绪时也必须对模型可见:动态提示词会引导 Agent 先调用它,
-    它内部按 thread_id 完成映射(未命中即创建),之后沙箱工具会在下一次模型调用时出现。
-    """
-
     async def _run(runtime: ToolRuntime) -> str:
         thread_id = _thread_id_from_runtime(runtime)
         try:
@@ -166,18 +134,9 @@ def _create_sandbox_tools(pool: Any) -> list[BaseTool]:
     if pool is None:
         return []
     timeouts = {
-        "read_file": 10,
-        "write_file": 10,
-        "list_files": 10,
-        "execute_code": 120,
-        "execute_command": 120,
-        "glob_files": 10,
-        "grep_files": 30,
-        "edit_file": 10,
-        "apply_patch": 10,
-        "web_fetch": 30,
-        "search_files": 30,
-        "make_directory": 5,
+        "read_file": 10, "write_file": 10, "list_files": 10, "execute_code": 120,
+        "execute_command": 120, "glob_files": 10, "grep_files": 30, "edit_file": 10,
+        "apply_patch": 10, "web_fetch": 30, "search_files": 30, "make_directory": 5,
     }
     tools = [_make_prepare_sandbox_tool(pool)]
     tools.extend(
@@ -188,155 +147,78 @@ def _create_sandbox_tools(pool: Any) -> list[BaseTool]:
 
 
 SANDBOX_TOOL_DESCRIPTIONS = {
-    "read_file": (
-        "读取沙箱中指定文件的内容(分片读取,单次最多 100 行)。"
-        "参数: path(文件路径), start_line(起始行,默认1), length(读取行数,默认100)。"
-        "适用场景: 已经定位到大致位置,需要精读上下文时。"
-        "使用策略: 按需读取,命中目标后立即停止,不要为了'读完'而继续。"
-        "与其他工具的关系: 全局检索关键词用 grep_files(更快、更省上下文);"
-        "统计/聚合/计算用 execute_code(精确,不产生数值幻觉)。"
-    ),
-    "write_file": (
-        "将内容写入沙箱中的文件。"
-        "参数: path(文件路径), content(完整文件内容)。"
-        "适用场景: 创建新文件,或需要完全覆盖现有文件内容时。"
-        "与其他工具的关系: 只改局部内容用 edit_file(精确替换),避免整文件重写。"
-    ),
-    "list_files": (
-        "列出指定目录下的文件和子目录。"
-        "参数: path(目录路径), pattern(可选,文件名匹配模式)。"
-        "适用场景: 需要先了解工作区结构时的第一选择。"
-    ),
-    "execute_code": (
-        "在沙箱中执行 Python 代码。"
-        "参数: code(Python 代码字符串), language(默认 python)。"
-        "适用场景: 数值计算、数据处理、生成图表等需要精确计算的任务。"
-        "使用策略: 能用代码算的不要让模型去'估'(避免数值幻觉)。"
-        "注意: 沙箱预装了 numpy/pandas/matplotlib 等库。"
-    ),
-    "execute_command": (
-        "在沙箱中执行 Shell 命令。"
-        "参数: command(Shell 命令字符串)。"
-        "使用策略: 优先用专用工具(read_file/grep_files/execute_code),仅在必要时才用 shell。"
-        "注意: 此工具需要用户确认。"
-    ),
-    "glob_files": (
-        "使用 glob 模式按文件名搜索文件。"
-        "参数: pattern(glob 模式,如 **/*.py), path(搜索起始路径)。"
-        "与其他工具的关系: 按'文件名'找用 glob_files;按'内容'找用 grep_files。"
-    ),
-    "grep_files": (
-        "在文件内容中按模式检索,返回命中位置与行号。"
-        "参数: pattern(搜索模式), path(搜索路径), file_pattern(文件匹配模式)。"
-        "适用场景: 还不确定信息在文件哪一部分时的第一选择。"
-        "使用策略: 上限 100 个匹配,够用即可;定位后再用 read_file 精读。"
-    ),
-    "edit_file": (
-        "编辑沙箱中的文件(精确文本替换)。"
-        "参数: path(文件路径), old_text(要被替换的原文本), new_text(替换后的新文本)。"
-        "使用策略: 精确匹配失败时自动尝试 9 种模糊策略。"
-    ),
-    "apply_patch": (
-        "应用 unified diff 格式的补丁到文件。"
-        "参数: path(文件路径), diff(unified diff 内容)。"
-        "适用场景: 一次性做多处结构化修改时,比多次 edit_file 更可靠。"
-    ),
-    "web_fetch": (
-        "获取指定 URL 的网页内容。"
-        "参数: url(URL)。"
-        "安全: 自动拒绝内网 IP,防止 SSRF。此工具需要用户确认。"
-    ),
-    "search_files": (
-        "在沙箱文件系统中搜索内容。"
-        "参数: query(搜索关键词), path(搜索路径)。"
-        "与其他工具的关系: 需要正则/文件名过滤时用 grep_files 更精确。"
-    ),
-    "make_directory": (
-        "在沙箱中创建目录。"
-        "参数: path(目录路径)。"
-    ),
+    "read_file": "读取沙箱中指定文件的内容。参数: path, start_line, length。",
+    "write_file": "将内容写入沙箱中的文件。参数: path, content。",
+    "list_files": "列出指定目录下的文件和子目录。参数: path, pattern。",
+    "execute_code": "在沙箱中执行 Python 代码。参数: code, language。",
+    "execute_command": "在沙箱中执行 Shell 命令。参数: command。需用户确认。",
+    "glob_files": "使用 glob 模式按文件名搜索文件。参数: pattern, path。",
+    "grep_files": "在文件内容中按模式检索。参数: pattern, path, file_pattern。",
+    "edit_file": "编辑沙箱中的文件。参数: path, old_text, new_text。",
+    "apply_patch": "应用 unified diff 补丁。参数: path, diff。",
+    "web_fetch": "获取指定 URL 的网页内容。参数: url。需用户确认。",
+    "search_files": "在沙箱文件系统中搜索内容。参数: query, path。",
+    "make_directory": "在沙箱中创建目录。参数: path。",
 }
 
 
 class ReadFileArgs(BaseModel):
     path: str = Field(..., description="文件路径")
-    start_line: int = Field(1, description="起始行号,从1开始")
-    length: int = Field(100, description="读取的行数")
-
+    start_line: int = Field(1, description="起始行号")
+    length: int = Field(100, description="读取行数")
 
 class WriteFileArgs(BaseModel):
     path: str = Field(..., description="文件路径")
-    content: str = Field(..., description="要写入的完整文件内容")
-
+    content: str = Field(..., description="文件内容")
 
 class ListFilesArgs(BaseModel):
     path: str = Field("/home/admin/workspace", description="目录路径")
-    pattern: str = Field("*", description="文件名匹配模式(glob)")
-
+    pattern: str = Field("*", description="glob 模式")
 
 class ExecuteCodeArgs(BaseModel):
-    code: str = Field(..., description="要执行的Python代码")
-    language: str = Field("python", description="语言,默认python")
-
+    code: str = Field(..., description="Python 代码")
+    language: str = Field("python", description="语言")
 
 class ExecuteCommandArgs(BaseModel):
-    command: str = Field(..., description="要执行的Shell命令")
-
+    command: str = Field(..., description="Shell 命令")
 
 class GlobFilesArgs(BaseModel):
-    pattern: str = Field(..., description="glob匹配模式,如 **/*.py")
-    path: str = Field("/home/admin/workspace", description="搜索起始路径")
-
+    pattern: str = Field(..., description="glob 模式")
+    path: str = Field("/home/admin/workspace", description="搜索路径")
 
 class GrepFilesArgs(BaseModel):
-    pattern: str = Field(..., description="要搜索的正则模式")
+    pattern: str = Field(..., description="正则模式")
     path: str = Field("/home/admin/workspace", description="搜索路径")
     file_pattern: str = Field("*", description="文件匹配模式")
 
-
 class EditFileArgs(BaseModel):
     path: str = Field(..., description="文件路径")
-    old_text: str = Field(..., description="要被替换的原文本")
-    new_text: str = Field(..., description="替换后的新文本")
-
+    old_text: str = Field(..., description="原文本")
+    new_text: str = Field(..., description="新文本")
 
 class ApplyPatchArgs(BaseModel):
     path: str = Field(..., description="文件路径")
-    diff: str = Field(..., description="unified diff格式的补丁内容")
-
+    diff: str = Field(..., description="unified diff")
 
 class WebFetchArgs(BaseModel):
-    url: str = Field(..., description="要获取的URL")
-
+    url: str = Field(..., description="URL")
 
 class SearchFilesArgs(BaseModel):
     query: str = Field(..., description="搜索关键词")
     path: str = Field("/home/admin/workspace", description="搜索路径")
 
-
 class MakeDirectoryArgs(BaseModel):
-    path: str = Field(..., description="要创建的目录路径")
+    path: str = Field(..., description="目录路径")
 
 
 SANDBOX_TOOL_SCHEMAS: dict[str, type[BaseModel]] = {
-    "read_file": ReadFileArgs,
-    "write_file": WriteFileArgs,
-    "list_files": ListFilesArgs,
-    "execute_code": ExecuteCodeArgs,
-    "execute_command": ExecuteCommandArgs,
-    "glob_files": GlobFilesArgs,
-    "grep_files": GrepFilesArgs,
-    "edit_file": EditFileArgs,
-    "apply_patch": ApplyPatchArgs,
-    "web_fetch": WebFetchArgs,
-    "search_files": SearchFilesArgs,
+    "read_file": ReadFileArgs, "write_file": WriteFileArgs, "list_files": ListFilesArgs,
+    "execute_code": ExecuteCodeArgs, "execute_command": ExecuteCommandArgs,
+    "glob_files": GlobFilesArgs, "grep_files": GrepFilesArgs, "edit_file": EditFileArgs,
+    "apply_patch": ApplyPatchArgs, "web_fetch": WebFetchArgs, "search_files": SearchFilesArgs,
     "make_directory": MakeDirectoryArgs,
 }
 
-
-# ---------------------------------------------------------------------------
-# 普通工具(本地 / LSP / Web / 技能):创建期静态注册
-# ---------------------------------------------------------------------------
 
 def _create_local_tools() -> list[BaseTool]:
     from datetime import datetime
@@ -353,40 +235,30 @@ def _create_local_tools() -> list[BaseTool]:
 
     return [
         StructuredTool.from_function(
-            coroutine=_get_current_time,
-            name="get_current_time",
+            coroutine=_get_current_time, name="get_current_time",
             description="获取当前时间,返回ISO格式字符串。",
         ),
         StructuredTool.from_function(
-            coroutine=_check_syntax,
-            name="check_syntax",
-            description="检查Python代码语法是否正确。参数: code(Python代码)。",
+            coroutine=_check_syntax, name="check_syntax",
+            description="检查Python代码语法是否正确。参数: code。",
         ),
     ]
 
 
 def _create_lsp_tools() -> list[BaseTool]:
     async def _lsp_hover(path: str, line: int = 0, character: int = 0) -> str:
-        return f"Hover info for {path}:{line}:{character} (AST analysis)"
-
+        return f"Hover info for {path}:{line}:{character}"
     async def _lsp_references(path: str, line: int = 0, character: int = 0) -> str:
-        return f"References for {path}:{line}:{character} (line scan)"
-
+        return f"References for {path}:{line}:{character}"
     async def _lsp_diagnostics(path: str) -> str:
-        return f"Diagnostics for {path} (compile check)"
-
+        return f"Diagnostics for {path}"
     async def _lsp_symbols(path: str) -> str:
-        return f"Symbols for {path} (ast.walk)"
-
+        return f"Symbols for {path}"
     return [
-        StructuredTool.from_function(coroutine=_lsp_hover, name="lsp_hover",
-            description="获取代码hover信息。参数: path, line, character。"),
-        StructuredTool.from_function(coroutine=_lsp_references, name="lsp_references",
-            description="查找代码引用。参数: path, line, character。"),
-        StructuredTool.from_function(coroutine=_lsp_diagnostics, name="lsp_diagnostics",
-            description="获取代码诊断信息。参数: path。"),
-        StructuredTool.from_function(coroutine=_lsp_symbols, name="lsp_symbols",
-            description="提取代码符号。参数: path。"),
+        StructuredTool.from_function(coroutine=_lsp_hover, name="lsp_hover", description="获取代码hover信息。"),
+        StructuredTool.from_function(coroutine=_lsp_references, name="lsp_references", description="查找代码引用。"),
+        StructuredTool.from_function(coroutine=_lsp_diagnostics, name="lsp_diagnostics", description="获取代码诊断信息。"),
+        StructuredTool.from_function(coroutine=_lsp_symbols, name="lsp_symbols", description="提取代码符号。"),
     ]
 
 
@@ -408,27 +280,14 @@ def _create_web_tools() -> list[BaseTool]:
 
     return [
         StructuredTool.from_function(
-            coroutine=_web_search,
-            name="web_search",
-            description="网络搜索(DuckDuckGo+百度)。参数: query(搜索词), max_results(最大结果数)。",
+            coroutine=_web_search, name="web_search",
+            description="网络搜索(DuckDuckGo)。参数: query, max_results。",
         ),
     ]
 
 
-# ---------------------------------------------------------------------------
-# Agent 装配:create_agent + 可插拔 Middleware 栈
-# ---------------------------------------------------------------------------
-
-def create_claude_agent(sandbox_pool=None, skills=None, checkpointer=None, config=None) -> dict:
-    """按项目二的「可插拔组合」方式装配 Agent。
-
-    - 普通工具在创建期静态注册;
-    - 沙箱工具同样进入工具列表(供 ToolNode 执行),但是否对模型可见由
-      :class:`SandboxMiddleware` 在每次模型调用前依据沙箱实时状态决定;
-    - 沙箱实现(远端 / 本地)对 Agent 透明,只通过 ``sandbox_pool`` 注入。
-    """
+def create_claude_agent(sandbox_pool=None, skills=None, checkpointer=None, config=None, skills_registry=None) -> dict:
     cfg = config or Config.get()
-
     llm = _get_llm(cfg)
 
     builtin_tools: list[BaseTool] = []
@@ -441,35 +300,27 @@ def create_claude_agent(sandbox_pool=None, skills=None, checkpointer=None, confi
             for tool in skill.get("tools", []):
                 builtin_tools.append(tool)
 
+    # Hermes 风格技能执行器:list_skills + use_skill
+    if skills_registry is not None:
+        from app.core.skills.executor import create_skill_executor_tools
+        builtin_tools.extend(create_skill_executor_tools(skills_registry))
+
     sandbox_tools = _create_sandbox_tools(sandbox_pool)
 
     sandbox_middleware, stack = build_middleware_stack(
-        sandbox_pool=sandbox_pool,
-        config=cfg,
-        headroom=HeadroomService.get_instance(),
+        sandbox_pool=sandbox_pool, config=cfg, headroom=HeadroomService.get_instance(),
     )
     sandbox_middleware.set_sandbox_tools(sandbox_tools)
 
     agent = create_agent(
-        llm,
-        tools=builtin_tools + sandbox_tools,
-        middleware=stack,
-        checkpointer=checkpointer,
+        llm, tools=builtin_tools + sandbox_tools,
+        middleware=stack, checkpointer=checkpointer,
     )
 
-    return {
-        "graph": agent,
-        "middleware": sandbox_middleware,
-        "all_tools": builtin_tools + sandbox_tools,
-    }
+    return {"graph": agent, "middleware": sandbox_middleware, "all_tools": builtin_tools + sandbox_tools}
 
-
-# ---------------------------------------------------------------------------
-# 流式翻译:图内 custom 事件 + 模型流式增量 → 既有 SSE 事件契约
-# ---------------------------------------------------------------------------
 
 async def _translate_event(event: dict, callbacks: dict) -> AsyncGenerator:
-    """把一个 custom 事件翻译成一次回调调用,并透传回调产出的 SSE 字符串。"""
     kind = event.get("kind")
     handler = callbacks.get(kind)
     if handler is None:
@@ -499,41 +350,24 @@ async def _translate_event(event: dict, callbacks: dict) -> AsyncGenerator:
 
 
 async def stream_agent_response(
-    graph,
-    messages: list[BaseMessage],
-    thread_id: str = "",
+    graph, messages: list[BaseMessage], thread_id: str = "",
     abort_event: asyncio.Event | None = None,
-    on_step_start=None,
-    on_text_delta=None,
-    on_tool_call_progress=None,
-    on_tool_result=None,
-    on_step_finish=None,
-    on_error=None,
-    on_doom_loop=None,
-    on_confirm_request=None,
+    on_step_start=None, on_text_delta=None, on_tool_call_progress=None,
+    on_tool_result=None, on_step_finish=None, on_error=None,
+    on_doom_loop=None, on_confirm_request=None,
 ):
-    """驱动 ``create_agent`` 编译出的图,把过程信号翻译成既有 SSE 事件流。
-
-    与旧的手写 ReAct 图相比:
-    - 循环控制 / 工具执行完全交给框架,这里只做「事件翻译」;
-    - ``stream_mode=["custom","messages","values"]`` 分别取横切事件、模型流式增量与最终状态;
-    - ``thread_id`` 通过 config 注入,框架据此在工具内部完成 ``thread_id → sandbox_id`` 映射。
-    """
     callbacks = {
-        "step_start": on_step_start,
-        "text_delta": on_text_delta,
-        "tool_call_progress": on_tool_call_progress,
-        "tool_result": on_tool_result,
-        "step_finish": on_step_finish,
-        "error": on_error,
-        "doom_loop": on_doom_loop,
-        "confirm_request": on_confirm_request,
+        "step_start": on_step_start, "text_delta": on_text_delta,
+        "tool_call_progress": on_tool_call_progress, "tool_result": on_tool_result,
+        "step_finish": on_step_finish, "error": on_error,
+        "doom_loop": on_doom_loop, "confirm_request": on_confirm_request,
     }
 
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     last_prompt_tokens = 0
     full_text_parts: list[str] = []
     tool_calls: list = []
+    trajectory_records: list[ToolCallRecord] = []
     step_limit = False
 
     try:
@@ -580,9 +414,29 @@ async def stream_agent_response(
                 state_messages = payload.get("messages") if isinstance(payload, dict) else None
                 if state_messages:
                     tool_calls = []
+                    tc_map: dict[str, dict] = {}
                     for m in state_messages:
                         for tc in (getattr(m, "tool_calls", None) or []):
                             tool_calls.append(tc)
+                            tcid = tc.get("id")
+                            if tcid:
+                                tc_map[tcid] = {"name": tc.get("name", ""), "args": tc.get("args", {})}
+                    result_map: dict[str, str] = {}
+                    for m in state_messages:
+                        if isinstance(m, ToolMessage):
+                            result_map[m.tool_call_id] = m.content if isinstance(m.content, str) else str(m.content)
+                    seen = set()
+                    trajectory_records = []
+                    for tcid, info in tc_map.items():
+                        if tcid in seen:
+                            continue
+                        seen.add(tcid)
+                        result = result_map.get(tcid, "")
+                        status = "error" if result.startswith("Error") else "done"
+                        trajectory_records.append(ToolCallRecord(
+                            tool_name=info["name"], args=info["args"],
+                            result=result, status=status,
+                        ))
 
             if abort_event is not None and abort_event.is_set():
                 break
@@ -592,24 +446,28 @@ async def stream_agent_response(
         return
 
     if step_limit:
-        yield {
-            "type": "step_limit_reached",
-            "usage": usage,
-            "cumulative_usage": usage,
-            "context_tokens": last_prompt_tokens,
-        }
+        yield {"type": "step_limit_reached", "usage": usage, "cumulative_usage": usage, "context_tokens": last_prompt_tokens}
         return
 
     if abort_event is not None and abort_event.is_set():
         yield {"type": "aborted"}
         return
 
+    user_message = ""
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            user_message = m.content if isinstance(m.content, str) else str(m.content)
+            break
+
     yield {
-        "type": "done",
-        "usage": usage,
-        "cumulative_usage": usage,
+        "type": "done", "usage": usage, "cumulative_usage": usage,
         "context_tokens": last_prompt_tokens,
         "compression_pending": last_prompt_tokens > 128000 * 0.7,
-        "full_text": "".join(full_text_parts),
-        "tool_calls": tool_calls,
+        "full_text": "".join(full_text_parts), "tool_calls": tool_calls,
+        "trajectory": {
+            "user_message": user_message,
+            "tool_calls": [r.to_dict() for r in trajectory_records],
+            "final_response": "".join(full_text_parts),
+            "success": not step_limit and not (abort_event is not None and abort_event.is_set()),
+        },
     }
