@@ -157,23 +157,17 @@ class AgentService:
 
     async def _build_system_prompt(
         self, engine, conversation_id: str, user_id: str,
-        query: str, sandbox_adapter=None, skill_prompts: str = "",
+        query: str, skill_prompts: str = "",
     ) -> str:
+        # 沙箱的实时状态(工作区文件、可用沙箱工具)不再拼进静态系统提示词,
+        # 而是由 SandboxMiddleware 在每次模型调用前动态注入。
         user_summary, (compressed_summary, recent_msgs), rag_context = await asyncio.gather(
             self._load_user_summary(engine, user_id),
             self._load_compression_state(engine, conversation_id),
             self._load_rag_context(engine, user_id, query),
         )
 
-        fs_summary = ""
-        if sandbox_adapter:
-            try:
-                fs_summary = await sandbox_adapter.get_fs_summary()
-            except Exception:
-                pass
-
         return build_system_prompt(
-            fs_summary=fs_summary,
             user_summary=user_summary,
             compressed_summary=compressed_summary,
             recent_messages=recent_msgs,
@@ -280,7 +274,7 @@ class AgentService:
 
             system_prompt = await self._build_system_prompt(
                 engine, conversation_id, user_id,
-                content, sandbox_adapter, skill_prompts
+                content, skill_prompts
             )
 
             agent_components = await self._get_or_create_agent(

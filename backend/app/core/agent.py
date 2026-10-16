@@ -13,6 +13,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from app.config import Config
 from app.core.headroom_service import HeadroomService, emergency_compact
+from app.core.sandbox_middleware import SandboxMiddleware
 
 current_conversation_id: contextvars.ContextVar[str] = contextvars.ContextVar("conversation_id", default="")
 current_sandbox_adapter: contextvars.ContextVar[Any] = contextvars.ContextVar("sandbox_adapter", default=None)
@@ -156,7 +157,28 @@ async def _llm_invoke_with_retry(llm, messages, **kwargs):
     return await llm.ainvoke(messages, **kwargs)
 
 
-def build_agent_graph(bound_llm, tool_map: dict, cfg: Config):
+async def _with_sandbox_prompt(
+    messages: list[BaseMessage], middleware: SandboxMiddleware
+) -> list[BaseMessage]:
+    """把 middleware 依据沙箱实时状态生成的提示词前置到系统消息。
+
+    只影响本次模型调用的输入,不改动图的共享状态,避免把动态内容写进对话历史。
+    """
+    block = await middleware.build_prompt_block()
+    if not block:
+        return messages
+
+    enhanced = list(messages)
+    if enhanced and isinstance(enhanced[0], SystemMessage):
+        enhanced[0] = SystemMessage(content=f"{enhanced[0].content}\n\n{block}")
+    else:
+        enhanced.insert(0, SystemMessage(content=block))
+    return enhanced
+
+
+def build_agent_graph(
+    llm, builtin_tools: list, tool_map: dict, middleware: SandboxMiddleware, cfg: Config
+):
     """把 ReAct 循环构建成一张 LangGraph 状态图。
 
     图的拓扑:
@@ -167,8 +189,9 @@ def build_agent_graph(bound_llm, tool_map: dict, cfg: Config):
                   ▲                                   │
                   └───────────────────────────────────┘
 
-    - ``agent`` 节点: 流式调用 LLM,产出文本增量、工具调用进度,并做死循环检测、
-      权限确认与工具调用过滤,决定下一步走向。
+    - ``agent`` 节点: 调用前由 middleware 依据沙箱实时状态注入工具(沙箱是否就绪决定
+      是否提供沙箱工具)与动态提示词,然后流式调用 LLM,产出文本增量、工具调用进度,
+      并做死循环检测、权限确认与工具调用过滤,决定下一步走向。
     - ``tools`` 节点: 执行被放行的工具调用,回填 ``ToolMessage``,再回到 agent。
 
     节点通过 ``_write`` 把过程信息写入 custom stream,由外层
@@ -199,8 +222,11 @@ def build_agent_graph(bound_llm, tool_map: dict, cfg: Config):
         # ---- 流式调用 LLM,带上下文溢出压缩与可重试错误重试 ----
         while True:
             full_response = None
+            # middleware 依据沙箱实时状态注入工具集(沙箱未就绪时不提供沙箱工具)与动态提示词
+            llm_messages = await _with_sandbox_prompt(messages, middleware)
+            bound_llm = middleware.bind_llm(llm, builtin_tools)
             try:
-                async for chunk in bound_llm.astream(messages):
+                async for chunk in bound_llm.astream(llm_messages):
                     if abort_event is not None and abort_event.is_set():
                         return {"status": "aborted"}
 
@@ -234,7 +260,7 @@ def build_agent_graph(bound_llm, tool_map: dict, cfg: Config):
                     continue
                 if category == ErrorCategory.RETRYABLE:
                     try:
-                        full_response = await _llm_invoke_with_retry(bound_llm, messages)
+                        full_response = await _llm_invoke_with_retry(bound_llm, llm_messages)
                         break
                     except Exception as retry_err:
                         _write({"kind": "error", "error": str(retry_err)})
@@ -363,38 +389,47 @@ def create_claude_agent(sandbox_pool=None, skills=None, checkpointer=None, confi
 
     llm = _get_llm(cfg)
 
-    all_tools: list[BaseTool] = []
+    # 沙箱工具不在这里静态注册,而是交给 SandboxMiddleware,由它依据沙箱实时状态注入;
+    # 未启用沙箱(sandbox_pool 为空)时,不提供任何沙箱工具。
+    middleware = SandboxMiddleware(
+        sandbox_pool=sandbox_pool,
+        config=cfg,
+        sandbox_tool_factory=_create_sandbox_tools if sandbox_pool else None,
+    )
+
+    # 普通工具(本地 / Web / 技能)在创建期静态注册
+    builtin_tools: list[BaseTool] = []
     tool_map: dict[str, Any] = {}
 
-    if sandbox_pool:
-        for t in _create_sandbox_tools():
-            all_tools.append(t)
-            tool_map[t.name] = t
+    def _register(tool: BaseTool) -> None:
+        builtin_tools.append(tool)
+        tool_map[tool.name] = tool
 
     for t in _create_local_tools():
-        all_tools.append(t)
-        tool_map[t.name] = t
+        _register(t)
 
     for t in _create_lsp_tools():
-        all_tools.append(t)
-        tool_map[t.name] = t
+        _register(t)
 
     for t in _create_web_tools():
-        all_tools.append(t)
-        tool_map[t.name] = t
+        _register(t)
 
     if skills:
         for skill in skills:
             for tool in skill.get("tools", []):
-                all_tools.append(tool)
-                tool_map[tool.name] = tool
+                _register(tool)
 
-    bound_llm = llm.bind_tools(all_tools) if all_tools else llm
+    # 沙箱工具登记进执行映射(供 tools 节点执行),但只在沙箱就绪时才会提供给模型
+    sandbox_tools = middleware.sandbox_tools()
+    for t in sandbox_tools:
+        tool_map[t.name] = t
 
     return {
-        "graph": build_agent_graph(bound_llm, tool_map, cfg),
+        "graph": build_agent_graph(llm, builtin_tools, tool_map, middleware, cfg),
         "tool_map": tool_map,
-        "all_tools": all_tools,
+        "all_tools": builtin_tools + sandbox_tools,
+        "middleware": middleware,
+        "tool_kinds": {name: classify_tool(name).value for name in tool_map},
     }
 
 
@@ -490,6 +525,26 @@ SANDBOX_TOOL_DESCRIPTIONS = {
         "参数: path(目录路径)。"
     ),
 }
+
+
+class ToolKind(str, Enum):
+    """工具类型。
+
+    - ``SANDBOX``: 沙箱工具,必须在沙箱中就绪才能执行,由 SandboxMiddleware 依据
+      沙箱实时状态动态注入;
+    - ``BUILTIN``: 普通工具(本地/Web/技能),在创建 Agent 时静态注册。
+    """
+
+    SANDBOX = "sandbox"
+    BUILTIN = "builtin"
+
+
+SANDBOX_TOOL_NAMES: frozenset[str] = frozenset(SANDBOX_TOOL_DESCRIPTIONS)
+
+
+def classify_tool(name: str) -> ToolKind:
+    """判断一个工具名属于沙箱工具还是普通工具。"""
+    return ToolKind.SANDBOX if name in SANDBOX_TOOL_NAMES else ToolKind.BUILTIN
 
 
 class ReadFileArgs(BaseModel):

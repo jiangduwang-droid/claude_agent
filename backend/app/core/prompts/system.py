@@ -33,7 +33,6 @@ SKILL_PROMPT_SUFFIX = """
 
 def build_system_prompt(
     base_prompt: str = "",
-    fs_summary: str = "",
     user_summary: str = "",
     compressed_summary: str = "",
     recent_messages: str = "",
@@ -41,9 +40,6 @@ def build_system_prompt(
     skill_prompts: str = "",
 ) -> str:
     parts = [base_prompt or SYSTEM_PROMPT_TEMPLATE]
-
-    if fs_summary:
-        parts.append(f"\n## 工作区状态\n{fs_summary}")
 
     if user_summary:
         parts.append(f"\n## 用户摘要\n{user_summary}")
@@ -61,3 +57,53 @@ def build_system_prompt(
         parts.append(f"\n## 可用技能\n{skill_prompts}")
 
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# 沙箱动态提示词
+#
+# 这部分提示词由 SandboxMiddleware 在每次模型调用前生成,内容来自沙箱的实时状态
+# (是否就绪、工作目录、当前工作区文件、当前可用的沙箱工具),因此不适合放进静态的
+# SYSTEM_PROMPT_TEMPLATE。
+# ---------------------------------------------------------------------------
+
+DEFAULT_WORKING_DIR = "/home/admin/workspace"
+
+PREINSTALLED_PACKAGES = "numpy, pandas, matplotlib, pillow, openpyxl, scipy, requests"
+
+SANDBOX_READY_TEMPLATE = """## 沙箱环境(实时状态)
+- 状态: 就绪
+- 工作目录: {working_dir}
+- 预装库: {preinstalled}
+- 当前可用沙箱工具: {tools}"""
+
+SANDBOX_UNAVAILABLE_TEMPLATE = """## 沙箱环境(实时状态)
+- 状态: 暂不可用
+- 当前无法执行文件操作与代码执行;如需这些能力请提示用户稍后重试。"""
+
+
+def build_sandbox_prompt(
+    ready: bool,
+    working_dir: str = DEFAULT_WORKING_DIR,
+    tools: list[str] | None = None,
+    preinstalled: str = PREINSTALLED_PACKAGES,
+    fs_summary: str = "",
+) -> str:
+    """根据沙箱的实时状态生成动态提示词片段。
+
+    - 沙箱未就绪时: 只给出"不可用"的简短说明;
+    - 沙箱就绪时: 给出工作目录、预装库、当前可用沙箱工具,以及最新的工作区文件列表。
+    """
+    if not ready:
+        return SANDBOX_UNAVAILABLE_TEMPLATE
+
+    blocks = [
+        SANDBOX_READY_TEMPLATE.format(
+            working_dir=working_dir,
+            preinstalled=preinstalled,
+            tools=", ".join(tools or []) or "(none)",
+        )
+    ]
+    if fs_summary:
+        blocks.append(f"## 当前工作区文件\n{fs_summary}")
+    return "\n\n".join(blocks)
