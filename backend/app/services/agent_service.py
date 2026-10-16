@@ -214,6 +214,25 @@ class AgentService:
             session.add(assistant_msg)
             await session.commit()
 
+    async def _save_tool_messages(
+        self, engine, conversation_id: str, tool_messages: list[ToolMessage],
+    ) -> None:
+        """把本轮产生的 ToolMessage 落库。
+
+        tool_call_id 存在 Message.tool_calls JSON 字段里
+        (与 _load_messages_from_db 的读取逻辑对应)。
+        """
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            for tm in tool_messages:
+                content = tm.content if isinstance(tm.content, str) else str(tm.content)
+                session.add(Message(
+                    conversation_id=uuid.UUID(conversation_id),
+                    role="tool",
+                    content=content,
+                    tool_calls={"id": getattr(tm, "tool_call_id", "")},
+                ))
+            await session.commit()
+
     async def _sync_sandbox_id(self, engine, conversation_id: str, sandbox_pool) -> None:
         if sandbox_pool is None:
             return
@@ -289,6 +308,7 @@ class AgentService:
             full_response_text = ""
             all_tool_calls: list = []
             trajectory_data: dict | None = None
+            tool_messages: list[ToolMessage] = []
 
             async for event in stream_agent_response(
                 agent_components["graph"],
@@ -303,12 +323,15 @@ class AgentService:
                     tool_id=_chunk_field(chunk, "id"),
                     args=_chunk_field(chunk, "args", {}),
                 ),
-                on_tool_result=lambda tm: _async_sse(
-                    "tool_result",
-                    tool_call_id=getattr(tm, "tool_call_id", ""),
-                    result=tm.content if isinstance(tm.content, str) else str(tm.content),
-                    status="done",
-                ),
+                on_tool_result=lambda tm: (
+                    tool_messages.append(tm),
+                    _async_sse(
+                        "tool_result",
+                        tool_call_id=getattr(tm, "tool_call_id", ""),
+                        result=tm.content if isinstance(tm.content, str) else str(tm.content),
+                        status="done",
+                    ),
+                )[1],
                 on_step_finish=lambda step: _async_sse("finish_step", step=step),
                 on_error=lambda err: _async_sse("error", error=err),
                 on_doom_loop=lambda tool_name: _async_sse(
@@ -351,9 +374,11 @@ class AgentService:
                 engine, conversation_id, full_response_text, all_tool_calls, None
             )
 
+            if tool_messages:
+                await self._save_tool_messages(engine, conversation_id, tool_messages)
+
             await self._sync_sandbox_id(engine, conversation_id, sandbox_pool)
 
-            # 自迭代闭环:持久化轨迹 + 触发后台评审(异步,不阻塞响应)
             if trajectory_data is not None and trajectory_store is not None:
                 try:
                     trajectory = Trajectory(
@@ -401,7 +426,6 @@ class AgentService:
 
     @staticmethod
     async def _run_evolution_review(reviewer, trajectory) -> None:
-        """异步执行自迭代评审,异常静默(不影响主流程)。"""
         print(f"[Evolution] start review for trajectory={trajectory.trajectory_id} tool_calls={trajectory.tool_call_count}")
         try:
             result = await reviewer.review_and_evolve(trajectory)
@@ -417,7 +441,6 @@ class AgentService:
 
 
 def _chunk_field(chunk, key: str, default=""):
-    """工具调用增量既可能是 dict,也可能是 ToolCallChunk 对象,统一取值。"""
     if isinstance(chunk, dict):
         return chunk.get(key, default)
     return getattr(chunk, key, default) or default
