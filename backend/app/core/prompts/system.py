@@ -38,3 +38,69 @@ SKILL_PROMPT_SUFFIX = """
 ## 可用技能
 以下技能已加载,可按需使用:
 """
+
+
+def build_system_prompt(
+    base_prompt: str = "",
+    user_summary: str = "",
+    compressed_summary: str = "",
+    recent_messages: str = "",
+    rag_context: str = "",
+    skill_prompts: str = "",
+) -> str:
+    parts = [base_prompt or SYSTEM_PROMPT_TEMPLATE]
+
+    if user_summary:
+        parts.append(f"\n## 用户摘要\n{user_summary}")
+
+    if compressed_summary:
+        parts.append(f"\n## 对话历史摘要\n{compressed_summary}")
+
+    if recent_messages:
+        parts.append(f"\n## 最近消息\n{recent_messages}")
+
+    if rag_context:
+        parts.append(f"\n## 知识库检索结果\n{rag_context}")
+
+    if skill_prompts:
+        parts.append(f"\n## 可用技能\n{skill_prompts}")
+
+    return "\n".join(parts)
+
+
+DEFAULT_WORKING_DIR = "/home/admin/workspace"
+
+PREINSTALLED_PACKAGES = "numpy, pandas, matplotlib, pillow, openpyxl, scipy, requests"
+
+SANDBOX_READY_TEMPLATE = """## 沙箱环境(实时状态)
+- 状态: 就绪
+- 工作目录: {working_dir}
+- 预装库: {preinstalled}
+- 当前可用沙箱工具: {tools}"""
+
+SANDBOX_UNAVAILABLE_TEMPLATE = """## 沙箱环境(实时状态)
+- 状态: 未就绪
+- 当前没有可用的沙箱环境。若任务需要文件操作或代码执行,请先调用 prepare_sandbox
+  准备环境;沙箱就绪后文件系统与代码执行类工具会自动出现。"""
+
+
+def build_sandbox_prompt(
+    ready: bool,
+    working_dir: str = DEFAULT_WORKING_DIR,
+    tools: list[str] | None = None,
+    preinstalled: str = PREINSTALLED_PACKAGES,
+    fs_summary: str = "",
+) -> str:
+    if not ready:
+        return SANDBOX_UNAVAILABLE_TEMPLATE
+
+    blocks = [
+        SANDBOX_READY_TEMPLATE.format(
+            working_dir=working_dir,
+            preinstalled=preinstalled,
+            tools=", ".join(tools or []) or "(none)",
+        )
+    ]
+    if fs_summary:
+        blocks.append(f"## 当前工作区文件\n{fs_summary}")
+    return "\n\n".join(blocks)
