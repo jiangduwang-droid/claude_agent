@@ -233,6 +233,32 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Lifespan] Sandbox pool init skipped: {e}")
 
+    try:
+        from app.core.skills.registry import SkillRegistry
+        skills_registry = SkillRegistry()
+        skills_registry.load_all()
+        app.state.skills_registry = skills_registry
+        print(f"[Lifespan] Skills loaded: {len(skills_registry._skills)}")
+    except Exception as e:
+        print(f"[Lifespan] Skills init skipped: {e}")
+
+    try:
+        from app.core.evolution.store import TrajectoryStore
+        from app.core.evolution.reviewer import EvolutionReviewer
+        app.state.trajectory_store = TrajectoryStore()
+        evo_cfg = config.raw().get("evolution", {})
+        app.state.evolution_reviewer = EvolutionReviewer(
+            config=config,
+            skills_dir="skills",
+            min_tool_calls=evo_cfg.get("min_tool_calls", 2),
+            enabled=evo_cfg.get("enabled", True),
+        )
+        if getattr(app.state, "skills_registry", None) is not None:
+            app.state.evolution_reviewer.bind_registry(app.state.skills_registry)
+        print("[Lifespan] Evolution pipeline initialized.")
+    except Exception as e:
+        print(f"[Lifespan] Evolution init skipped: {e}")
+
     yield
 
     if hasattr(app.state, "sandbox_pool"):
@@ -241,60 +267,3 @@ async def lifespan(app: FastAPI):
         await app.state.mcp_manager.disconnect_all()
     await engine.dispose()
     print("[Lifespan] Shutdown complete.")
-
-
-async def _on_stream_completed(conversation_id: str, **kwargs):
-    print(f"[EventBus] Stream completed: {conversation_id}")
-
-
-async def _on_stream_aborted(conversation_id: str, **kwargs):
-    print(f"[EventBus] Stream aborted: {conversation_id}")
-
-
-async def _on_doom_loop(conversation_id: str, **kwargs):
-    print(f"[EventBus] Doom loop detected: {conversation_id}")
-
-
-async def _on_step_limit(conversation_id: str, **kwargs):
-    print(f"[EventBus] Step limit reached: {conversation_id}")
-
-
-async def _on_sandbox_allocated(conversation_id: str, sandbox_id: str, **kwargs):
-    print(f"[EventBus] Sandbox allocated: {conversation_id} -> {sandbox_id}")
-
-
-def create_app() -> FastAPI:
-    config = Config.get()
-
-    app = FastAPI(
-        title="Cloud Claude Agent",
-        version="1.1.0",
-        description="AI Agent Web Application with persistent sandbox workspace and RAG knowledge base",
-        lifespan=lifespan,
-    )
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    app.add_middleware(AuthAndRateLimitMiddleware, config=config)
-
-    from app.api import auth, chat, conversations, knowledge, skills, settings, admin
-
-    app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
-    app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
-    app.include_router(conversations.router, prefix="/api/v1/conversations", tags=["conversations"])
-    app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["knowledge"])
-    app.include_router(skills.router, prefix="/api/v1/skills", tags=["skills"])
-    app.include_router(settings.router, prefix="/api/v1/settings", tags=["settings"])
-    app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])
-
-    @app.get("/health")
-    async def health():
-        return {"status": "ok"}
-
-    return app
