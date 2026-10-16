@@ -74,33 +74,27 @@ class AuthAndRateLimitMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-
         path = scope.get("path", "")
         headers = dict((k.decode().lower(), v.decode()) for k, v in scope.get("headers", []))
         api_key_header = headers.get("x-api-key", "")
-
         if api_key_header == self.config.api_key and self.config.api_key:
             await self.app(scope, receive, send)
             return
-
         if path in self.exempt_paths:
             if not self.rate_limiter.check(_DummyRequest(scope, headers)):
                 await _send_429(send)
                 return
             await self.app(scope, receive, send)
             return
-
         if "authorization" in headers:
             if not self.rate_limiter.check(_DummyRequest(scope, headers)):
                 await _send_429(send)
                 return
             await self.app(scope, receive, send)
             return
-
         if self.config.api_key:
             await _send_401(send)
             return
-
         await self.app(scope, receive, send)
 
 
@@ -111,56 +105,44 @@ class _DummyRequest:
 
 
 async def _send_401(send):
-    await send({
-        "type": "http.response.start", "status": 401,
-        "headers": [[b"content-type", b"application/json"]],
-    })
+    await send({"type": "http.response.start", "status": 401, "headers": [[b"content-type", b"application/json"]]})
     await send({"type": "http.response.body", "body": b'{"detail":"Unauthorized"}'})
 
 
 async def _send_429(send):
-    await send({
-        "type": "http.response.start", "status": 429,
-        "headers": [[b"content-type", b"application/json"]],
-    })
+    await send({"type": "http.response.start", "status": 429, "headers": [[b"content-type", b"application/json"]]})
     await send({"type": "http.response.body", "body": b'{"detail":"Too Many Requests"}'})
 
 
 async def _parallel_warmup(config: Config):
     tasks = []
-
     def _warmup_embedding():
         try:
             from sentence_transformers import SentenceTransformer
             SentenceTransformer(config.rag_config["embedding_model"])
         except Exception:
             pass
-
     def _warmup_reranker():
         try:
             from sentence_transformers import CrossEncoder
             CrossEncoder(config.rag_config["rerank_model"])
         except Exception:
             pass
-
     def _warmup_headroom():
         try:
             HeadroomService.get_instance()
         except Exception:
             pass
-
     def _warmup_jieba():
         try:
             import jieba
             list(jieba.cut("预热"))
         except Exception:
             pass
-
     tasks.append(asyncio.to_thread(_warmup_embedding))
     tasks.append(asyncio.to_thread(_warmup_reranker))
     tasks.append(asyncio.to_thread(_warmup_headroom))
     tasks.append(asyncio.to_thread(_warmup_jieba))
-
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
@@ -170,7 +152,6 @@ async def lifespan(app: FastAPI):
     from app.models.models import Base
 
     config = Config.get()
-
     engine = create_async_engine(config.database_url, echo=False, pool_pre_ping=True)
     app.state.engine = engine
     app.state.config = config
@@ -179,23 +160,6 @@ async def lifespan(app: FastAPI):
         await conn.execute(__import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.execute(__import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await conn.run_sync(Base.metadata.create_all)
-
-        await conn.execute(__import__("sqlalchemy").text(
-            "ALTER TABLE document_chunks "
-            "ALTER COLUMN content_tokens TYPE text USING content_tokens::text"
-        ))
-        await conn.execute(__import__("sqlalchemy").text(
-            "DROP INDEX IF EXISTS idx_doc_chunks_content_ts"
-        ))
-        await conn.execute(__import__("sqlalchemy").text(
-            "CREATE INDEX IF NOT EXISTS idx_doc_chunks_tokens_ts "
-            "ON document_chunks USING gin(to_tsvector('simple', content_tokens))"
-        ))
-        await conn.execute(__import__("sqlalchemy").text(
-            "CREATE INDEX IF NOT EXISTS idx_doc_chunks_embedding_hnsw "
-            "ON document_chunks USING hnsw (embedding vector_cosine_ops) "
-            "WITH (m=16, ef_construction=200)"
-        ))
 
     app.state.permission_manager = PermissionManager(config)
 
@@ -267,3 +231,46 @@ async def lifespan(app: FastAPI):
         await app.state.mcp_manager.disconnect_all()
     await engine.dispose()
     print("[Lifespan] Shutdown complete.")
+
+
+async def _on_stream_completed(conversation_id: str, **kwargs):
+    print(f"[EventBus] Stream completed: {conversation_id}")
+
+async def _on_stream_aborted(conversation_id: str, **kwargs):
+    print(f"[EventBus] Stream aborted: {conversation_id}")
+
+async def _on_doom_loop(conversation_id: str, **kwargs):
+    print(f"[EventBus] Doom loop detected: {conversation_id}")
+
+async def _on_step_limit(conversation_id: str, **kwargs):
+    print(f"[EventBus] Step limit reached: {conversation_id}")
+
+async def _on_sandbox_allocated(conversation_id: str, sandbox_id: str, **kwargs):
+    print(f"[EventBus] Sandbox allocated: {conversation_id} -> {sandbox_id}")
+
+
+def create_app() -> FastAPI:
+    config = Config.get()
+    app = FastAPI(
+        title="Cloud Claude Agent",
+        version="1.1.0",
+        description="AI Agent Web Application with persistent sandbox workspace and RAG knowledge base",
+        lifespan=lifespan,
+    )
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+    app.add_middleware(AuthAndRateLimitMiddleware, config=config)
+
+    from app.api import auth, chat, conversations, knowledge, skills, settings, admin
+    app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
+    app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
+    app.include_router(conversations.router, prefix="/api/v1/conversations", tags=["conversations"])
+    app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["knowledge"])
+    app.include_router(skills.router, prefix="/api/v1/skills", tags=["skills"])
+    app.include_router(settings.router, prefix="/api/v1/settings", tags=["settings"])
+    app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    return app
