@@ -16,6 +16,7 @@ from app.core.agent import (
     create_claude_agent, stream_agent_response,
     current_conversation_id, current_permission_manager
 )
+from app.core.evolution.trajectory import Trajectory, ToolCallRecord
 from app.core.event_bus import event_bus, EventType
 from app.core.permissions import PermissionManager
 from app.core.prompts.system import build_system_prompt
@@ -28,6 +29,7 @@ class AgentService:
     _streaming: set[str] = set()
     _abort_events: dict[str, asyncio.Event] = {}
     _stale: set[str] = set()
+    _evolution_tasks: set[asyncio.Task] = set()
 
     @classmethod
     def get_instance(cls, conversation_id: str = "") -> "AgentService":
@@ -78,6 +80,7 @@ class AgentService:
                 skills=skills_list,
                 checkpointer=checkpointer,
                 config=self._config,
+                skills_registry=skills_registry,
             )
             self._agent_cache[conversation_id] = agent
             self._stale.discard(conversation_id)
@@ -157,8 +160,6 @@ class AgentService:
         self, engine, conversation_id: str, user_id: str,
         query: str, skill_prompts: str = "",
     ) -> str:
-        # 沙箱的实时状态(工作区文件、可用沙箱工具)不再拼进静态系统提示词,
-        # 而是由 SandboxMiddleware 在每次模型调用前动态注入。
         user_summary, (compressed_summary, recent_msgs), rag_context = await asyncio.gather(
             self._load_user_summary(engine, user_id),
             self._load_compression_state(engine, conversation_id),
@@ -214,11 +215,6 @@ class AgentService:
             await session.commit()
 
     async def _sync_sandbox_id(self, engine, conversation_id: str, sandbox_pool) -> None:
-        """流结束后把懒创建出来的 sandbox_id 回写数据库。
-
-        沙箱是 Agent 调用 prepare_sandbox 时按 thread_id 懒创建的,所以这里只读取映射
-        结果用于展示与删除清理,不在请求开始时急切创建沙箱。
-        """
         if sandbox_pool is None:
             return
         try:
@@ -250,6 +246,8 @@ class AgentService:
         skills_registry=None,
         checkpointer=None,
         permission_manager: PermissionManager | None = None,
+        trajectory_store=None,
+        evolution_reviewer=None,
     ) -> AsyncGenerator:
         lock = self._get_lock(conversation_id)
         try:
@@ -271,10 +269,6 @@ class AgentService:
                 engine, conversation_id, user_id, content, attachments
             )
 
-            # 沙箱不再在这里急切创建(对齐项目二): 映射未命中时由 SandboxMiddleware
-            # 在模型调用前注入「未就绪」提示词,引导 Agent 调用 prepare_sandbox 触发懒创建。
-            # 这里只需把 thread_id(= conversation_id)交给框架,映射由工具内部完成。
-
             skill_prompts = ""
             if skills_registry:
                 matched = skills_registry.match_skills(content)
@@ -294,6 +288,7 @@ class AgentService:
 
             full_response_text = ""
             all_tool_calls: list = []
+            trajectory_data: dict | None = None
 
             async for event in stream_agent_response(
                 agent_components["graph"],
@@ -338,6 +333,7 @@ class AgentService:
                         )
                         full_response_text = event.get("full_text", "")
                         all_tool_calls = event.get("tool_calls", [])
+                        trajectory_data = event.get("trajectory")
                     elif event.get("type") == "aborted":
                         yield _sse_event("aborted")
                     elif event.get("type") == "step_limit_reached":
@@ -357,6 +353,33 @@ class AgentService:
 
             await self._sync_sandbox_id(engine, conversation_id, sandbox_pool)
 
+            # 自迭代闭环:持久化轨迹 + 触发后台评审(异步,不阻塞响应)
+            if trajectory_data is not None and trajectory_store is not None:
+                try:
+                    trajectory = Trajectory(
+                        conversation_id=conversation_id,
+                        user_message=trajectory_data.get("user_message", content),
+                        tool_calls=[
+                            ToolCallRecord(
+                                tool_name=tc.get("tool_name", ""),
+                                args=tc.get("args", {}),
+                                result=tc.get("result", ""),
+                                status=tc.get("status", "done"),
+                            )
+                            for tc in trajectory_data.get("tool_calls", [])
+                        ],
+                        final_response=trajectory_data.get("final_response", ""),
+                        success=trajectory_data.get("success", True),
+                    )
+                    trajectory_store.save(trajectory)
+
+                    if evolution_reviewer is not None:
+                        task = asyncio.create_task(self._run_evolution_review(evolution_reviewer, trajectory))
+                        self._evolution_tasks.add(task)
+                        task.add_done_callback(self._evolution_tasks.discard)
+                except Exception as e:
+                    print(f"[AgentService] Evolution pipeline error: {e}")
+
             await event_bus.emit(EventType.STREAM_COMPLETED, conversation_id=conversation_id)
 
         except Exception as e:
@@ -375,6 +398,22 @@ class AgentService:
         event = self._abort_events.get(conversation_id)
         if event:
             event.set()
+
+    @staticmethod
+    async def _run_evolution_review(reviewer, trajectory) -> None:
+        """异步执行自迭代评审,异常静默(不影响主流程)。"""
+        print(f"[Evolution] start review for trajectory={trajectory.trajectory_id} tool_calls={trajectory.tool_call_count}")
+        try:
+            result = await reviewer.review_and_evolve(trajectory)
+            if result.get("skill_created"):
+                print(
+                    f"[Evolution] 新技能已生成: {result.get('skill_name')} "
+                    f"(trajectory={trajectory.trajectory_id})"
+                )
+            else:
+                print(f"[Evolution] 跳过: {result.get('reason')}")
+        except Exception as e:
+            print(f"[Evolution] review error: {e}")
 
 
 def _chunk_field(chunk, key: str, default=""):
