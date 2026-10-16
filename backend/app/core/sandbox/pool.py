@@ -1,10 +1,12 @@
 import asyncio
 import time
 import threading
+import uuid
 from typing import Any
 
 from app.config import Config
 from app.core.event_bus import event_bus, EventType
+from app.core.sandbox.store import SandboxSessionStore
 
 
 class SandboxEntry:
@@ -22,13 +24,24 @@ class SandboxEntry:
 
 
 class SandboxPoolManager:
+    """沙箱池。负责「会话 → 沙箱」的映射与沙箱实例生命周期。
+
+    对齐项目二 §4.3:
+
+    - ``thread_id → sandbox_id`` 的映射放在 :class:`SandboxSessionStore`(Redis + SETNX),
+      Agent 侧零感知;
+    - 没命中就懒创建,第一次调用时 ``create_sandbox`` 再写回映射,天然幂等;
+    - 实例失效时 :meth:`invalidate` 置空映射,下次调用按懒创建逻辑自动重建。
+    """
+
     def __init__(self, config: Config):
         self._config = config
+        self._store = SandboxSessionStore(config)
         self._sandboxes: dict[str, SandboxEntry] = {}
-        self._conversation_map: dict[str, str] = {}
         self._lock = threading.Lock()
         self._paused: dict[str, bool] = {}
         self._health_errors: dict[str, int] = {}
+        self._thread_locks: dict[str, asyncio.Lock] = {}
         self._sweeper_task: asyncio.Task | None = None
         self._docker_client = None
         self._init_docker()
@@ -40,50 +53,100 @@ class SandboxPoolManager:
         except Exception:
             self._docker_client = None
 
-    async def get_or_create(self, conversation_id: str) -> Any:
-        sandbox_id = None
+    @property
+    def store(self) -> SandboxSessionStore:
+        return self._store
 
-        with self._lock:
-            sid = self._conversation_map.get(conversation_id)
-            if sid:
-                entry = self._sandboxes.get(sid)
-                if entry:
-                    if entry.health_errors >= self._config.sandbox_max_health_errors:
-                        self._remove_locked(sid)
-                    else:
-                        entry.touch()
-                        sandbox_id = sid
+    def _thread_lock(self, thread_id: str) -> asyncio.Lock:
+        if thread_id not in self._thread_locks:
+            self._thread_locks[thread_id] = asyncio.Lock()
+        return self._thread_locks[thread_id]
 
-        if sandbox_id is None:
-            sandbox_id = await self._allocate(conversation_id)
-        else:
-            await self._unpause_if_needed(sandbox_id)
+    # ---- 会话 → 沙箱(Agent 侧零感知) ----
 
-        adapter = await self._create_adapter(sandbox_id)
+    def is_ready(self, thread_id: str) -> bool:
+        """映射命中即视为「沙箱就绪」,供 Middleware 生成动态提示词。"""
+        return self._store.is_ready(thread_id)
 
-        with self._lock:
+    async def get_or_create(self, thread_id: str) -> Any:
+        """命中映射则复用,未命中则懒创建;SETNX 保证一个会话只建一个沙箱。"""
+        if not thread_id:
+            thread_id = f"anon-{uuid.uuid4().hex[:8]}"
+
+        async with self._thread_lock(thread_id):
+            sandbox_id = self._store.get(thread_id)
+
+            if sandbox_id:
+                entry = self._sandboxes.get(sandbox_id)
+                if entry is not None:
+                    entry.touch()
+                    await self._unpause_if_needed(sandbox_id)
+                    if entry.adapter is None:
+                        entry.adapter = await self._create_adapter(sandbox_id)
+                    await event_bus.emit(EventType.SANDBOX_ALLOCATED,
+                                         conversation_id=thread_id, sandbox_id=sandbox_id)
+                    return entry.adapter
+                # 映射存在但本进程没有活的实例(重启 / 换实例):视为失效,置空后懒重建
+                self._store.invalidate(thread_id)
+
+            sandbox_id = await self._allocate(thread_id)
             entry = self._sandboxes.get(sandbox_id)
-            if entry:
-                entry.adapter = adapter
+            if entry is None:
+                entry = SandboxEntry(sandbox_id=sandbox_id)
+                with self._lock:
+                    self._sandboxes[sandbox_id] = entry
 
-        await event_bus.emit(EventType.SANDBOX_ALLOCATED,
-                             conversation_id=conversation_id,
-                             sandbox_id=sandbox_id)
-        return adapter
+            adapter = await self._create_adapter(sandbox_id)
+            entry.adapter = adapter
+            self._store.set(thread_id, sandbox_id)
 
-    async def _allocate(self, conversation_id: str) -> str:
+            await event_bus.emit(EventType.SANDBOX_ALLOCATED,
+                                 conversation_id=thread_id, sandbox_id=sandbox_id)
+            return adapter
+
+    def invalidate(self, thread_id: str) -> None:
+        """实例失效 / 会话删除:置空映射并丢弃本地实例,下次调用自动重建。"""
+        sandbox_id = self._store.get(thread_id)
+        self._store.invalidate(thread_id)
+        if sandbox_id:
+            with self._lock:
+                self._sandboxes.pop(sandbox_id, None)
+                self._paused.pop(sandbox_id, None)
+                self._health_errors.pop(sandbox_id, None)
+
+    def mark_stale(self, thread_id: str) -> None:
+        """连续失败达到阈值则置空映射,迫使下次懒重建。"""
+        sandbox_id = self._store.get(thread_id)
+        if not sandbox_id:
+            return
+        with self._lock:
+            errors = self._health_errors.get(sandbox_id, 0) + 1
+            self._health_errors[sandbox_id] = errors
+        if errors >= self._config.sandbox_max_health_errors:
+            self.invalidate(thread_id)
+
+    # ---- 沙箱实例创建 ----
+
+    async def _allocate(self, thread_id: str) -> str:
         if self._config.sandbox_domain:
             sandbox_obj = await self._create_remote_sandbox()
             sandbox_id = sandbox_obj.id
         else:
-            import uuid
-            sandbox_id = f"local-{str(uuid.uuid4())[:8]}"
+            sandbox_id = f"local-{uuid.uuid4().hex[:8]}"
             sandbox_obj = None
+
+        # SETNX:抢到锁才认这个沙箱;没抢到就复用别人刚建好的那个
+        if not self._store.set_if_absent(thread_id, sandbox_id):
+            if sandbox_obj is not None:
+                try:
+                    await sandbox_obj.destroy()
+                except Exception:
+                    pass
+            return self._store.get(thread_id) or sandbox_id
 
         entry = SandboxEntry(sandbox_id=sandbox_id, sandbox_obj=sandbox_obj)
         with self._lock:
             self._sandboxes[sandbox_id] = entry
-            self._conversation_map[conversation_id] = sandbox_id
         return sandbox_id
 
     async def _create_remote_sandbox(self) -> Any:
@@ -169,24 +232,6 @@ class SandboxPoolManager:
         else:
             from app.core.sandbox.local import LocalSandbox
             return LocalSandbox(sandbox_id)
-
-    def _remove_locked(self, sandbox_id: str) -> None:
-        conv_to_remove = [
-            conv for conv, sid in self._conversation_map.items() if sid == sandbox_id
-        ]
-        for conv in conv_to_remove:
-            del self._conversation_map[conv]
-        self._sandboxes.pop(sandbox_id, None)
-        self._paused.pop(sandbox_id, None)
-        self._health_errors.pop(sandbox_id, None)
-
-    def mark_stale(self, conversation_id: str) -> None:
-        with self._lock:
-            sid = self._conversation_map.get(conversation_id)
-            if sid:
-                entry = self._sandboxes.get(sid)
-                if entry:
-                    entry.health_errors += 1
 
     def is_streaming(self, conversation_id: str) -> bool:
         return False
@@ -279,6 +324,5 @@ class SandboxPoolManager:
 
         with self._lock:
             self._sandboxes.clear()
-            self._conversation_map.clear()
             self._paused.clear()
             self._health_errors.clear()

@@ -54,8 +54,6 @@ async def create_conversation(
     user: User = Depends(get_current_user),
 ):
     engine = request.app.state.engine
-    sandbox_pool = getattr(request.app.state, "sandbox_pool", None)
-    permission_manager: PermissionManager = getattr(request.app.state, "permission_manager", None)
 
     conv = Conversation(
         id=uuid.uuid4(),
@@ -64,15 +62,9 @@ async def create_conversation(
         model=req.model,
     )
 
-    sandbox_id = None
-    if sandbox_pool:
-        try:
-            adapter = await sandbox_pool.get_or_create(str(conv.id))
-            sandbox_id = adapter.sandbox_id
-        except Exception as e:
-            print(f"[Conversations] Sandbox allocation failed (degraded): {e}")
-
-    conv.sandbox_id = sandbox_id
+    # 沙箱按 thread_id(= conversation_id)懒创建(对齐项目二): 会话创建时不建沙箱,
+    # 由 Agent 在需要时调用 prepare_sandbox 触发,创建后再回写 sandbox_id。
+    conv.sandbox_id = None
 
     async with engine.begin() as conn:
         await conn.execute(
@@ -185,7 +177,7 @@ async def delete_conversation(
 
     async with engine.begin() as conn:
         result = await conn.execute(
-            select(Conversation.user_id, Conversation.sandbox_id)
+            select(Conversation.user_id)
             .where(Conversation.id == conv_uuid)
         )
         conv = result.mappings().one_or_none()
@@ -207,10 +199,10 @@ async def delete_conversation(
         permission_manager.clear_conversation(conversation_id)
 
     sandbox_pool = getattr(request.app.state, "sandbox_pool", None)
-    if sandbox_pool and conv["sandbox_id"]:
+    if sandbox_pool:
+        # 映射由 SandboxSessionStore 持有,删除会话时按 thread_id 置空即可
         try:
-            async with sandbox_pool._lock:
-                sandbox_pool._remove_locked(conv["sandbox_id"])
+            sandbox_pool.invalidate(conversation_id)
         except Exception:
             pass
 

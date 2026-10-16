@@ -1,103 +1,44 @@
+"""Agent 装配与流式事件翻译。
+
+对齐技术文档《AI Agent 系统构建实践技术文档》第 4 章「项目二：带文件系统与代码沙箱的
+Agent 系统」:
+
+- 用 ``create_agent`` 构建 ReAct Agent(循环、工具执行、状态流转交给框架);
+- 沙箱工具与动态提示词由 :class:`SandboxMiddleware` 在 ``awrap_model_call`` 切面集中注入,
+  业务 Agent 无需感知;
+- ``thread_id → sandbox_id`` 的映射在工具内部完成:工具用框架注入的 ``ToolRuntime`` 取
+  ``thread_id``,再向 :class:`SandboxPoolManager` 换取 ``sandbox_id``,因此 ``sandbox_id``
+  对模型完全不可见。
+
+``stream_agent_response`` 只负责把图内写的 custom 事件与模型流式增量翻译成前端既有的
+SSE 事件契约,不参与 ReAct 循环控制。
+"""
+
 import asyncio
 import contextvars
-import hashlib
-import json
-import time
-from enum import Enum
-from typing import Any, AsyncGenerator, TypedDict
+from typing import Any, AsyncGenerator
 
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain.agents import create_agent
+from langchain.tools import ToolRuntime
+from langchain_core.messages import (
+    AIMessageChunk,
+    BaseMessage,
+)
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.config import Config
-from app.core.headroom_service import HeadroomService, emergency_compact
-from app.core.sandbox_middleware import SandboxMiddleware
+from app.core.headroom_service import HeadroomService
+from app.core.sandbox_middleware import (
+    SandboxMiddleware,
+    build_middleware_stack,
+)
 
+# 这些 contextvar 由 AgentService 在一次对话请求开始时设置,供 Middleware 横切读取;
+# 工具侧则优先使用框架注入的 ToolRuntime(见项目二 §4.3)。
 current_conversation_id: contextvars.ContextVar[str] = contextvars.ContextVar("conversation_id", default="")
-current_sandbox_adapter: contextvars.ContextVar[Any] = contextvars.ContextVar("sandbox_adapter", default=None)
 current_permission_manager: contextvars.ContextVar[Any] = contextvars.ContextVar("permission_manager", default=None)
-
-
-class ErrorCategory(Enum):
-    RETRYABLE = "retryable"
-    CONTEXT_OVERFLOW = "context_overflow"
-    FATAL = "fatal"
-
-
-def classify_error(error: Exception) -> ErrorCategory:
-    error_str = str(error).lower()
-    if "context_length" in error_str or "context window" in error_str or "token" in error_str and "exceeded" in error_str:
-        return ErrorCategory.CONTEXT_OVERFLOW
-    if any(kw in error_str for kw in ["rate_limit", "timeout", "timed out", "overloaded", "5xx", "502", "503", "429"]):
-        return ErrorCategory.RETRYABLE
-    if any(kw in error_str for kw in ["api key", "authentication", "unauthorized", "forbidden"]):
-        return ErrorCategory.FATAL
-    return ErrorCategory.RETRYABLE
-
-
-try:
-    from langgraph.config import get_stream_writer
-except Exception:  # pragma: no cover - 兼容不支持 custom stream 的旧版 langgraph
-    def get_stream_writer():  # type: ignore[misc]
-        return lambda *_args, **_kwargs: None
-
-
-class AgentState(TypedDict, total=False):
-    """LangGraph 状态图的共享状态。
-
-    这里刻意不使用 ``add_messages`` reducer(即"整体覆盖"语义),这样节点可以
-    自由地增删、压缩消息列表,同时携带跨节点累计的 token 用量、文本、工具调用等指标。
-    """
-
-    messages: list
-    step: int
-    max_steps: int
-    doom_loop_threshold: int
-    headroom: Any
-    abort_event: Any
-    usage: dict
-    last_prompt_tokens: int
-    text_parts: list
-    tool_calls: list
-    allowed_tool_calls: list
-    call_history: list
-    status: str
-
-
-def _write(event: dict) -> None:
-    """向当前节点所属的 LangGraph 流写入自定义事件(custom stream mode)。
-
-    只在节点内部调用才有效;节点外调用会被安全地降级为空操作。
-    """
-    try:
-        writer = get_stream_writer()
-        writer(event)
-    except Exception:
-        return
-
-
-def _call_key(tool_name: str, args: dict) -> str:
-    args_str = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
-    return f"{tool_name}:{hashlib.sha256(args_str.encode()).hexdigest()[:12]}"
-
-
-def _is_doom_loop(history: list, tool_name: str, args: dict, threshold: int) -> bool:
-    """把本次调用加入历史,并判断是否连续 threshold 次完全相同的调用。
-
-    语义与旧版 StepTracker.check_doom_loop 保持一致。
-    """
-    history.append(_call_key(tool_name, args))
-    if len(history) > threshold:
-        del history[: len(history) - threshold]
-    if len(history) >= threshold:
-        return len(set(history)) == 1
-    return False
-
-
-class RetryableError(Exception):
-    pass
+current_abort_event: contextvars.ContextVar[Any] = contextvars.ContextVar("abort_event", default=None)
 
 
 def _get_llm(config: Config):
@@ -147,305 +88,34 @@ def _get_llm(config: Config):
         )
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=4),
-    retry=retry_if_exception_type((TimeoutError, ConnectionError, RetryableError)),
-    reraise=True,
-)
-async def _llm_invoke_with_retry(llm, messages, **kwargs):
-    return await llm.ainvoke(messages, **kwargs)
+# ---------------------------------------------------------------------------
+# 沙箱工具:签名里只有业务参数(绝不含 sandbox_id),thread_id 由 ToolRuntime 注入
+# ---------------------------------------------------------------------------
+
+def _thread_id_from_runtime(runtime: Any) -> str:
+    """从框架注入的 ToolRuntime 取 thread_id —— 映射的输入就来自这里(§4.3)。"""
+    try:
+        tid = runtime.config.get("configurable", {}).get("thread_id")
+    except Exception:
+        tid = None
+    if tid:
+        return str(tid)
+    return current_conversation_id.get() or ""
 
 
-async def _with_sandbox_prompt(
-    messages: list[BaseMessage], middleware: SandboxMiddleware
-) -> list[BaseMessage]:
-    """把 middleware 依据沙箱实时状态生成的提示词前置到系统消息。
+def _make_sandbox_tool(pool: Any, tool_name: str, tool_timeout: int = 60) -> BaseTool:
+    """构造一个沙箱工具。
 
-    只影响本次模型调用的输入,不改动图的共享状态,避免把动态内容写进对话历史。
-    """
-    block = await middleware.build_prompt_block()
-    if not block:
-        return messages
-
-    enhanced = list(messages)
-    if enhanced and isinstance(enhanced[0], SystemMessage):
-        enhanced[0] = SystemMessage(content=f"{enhanced[0].content}\n\n{block}")
-    else:
-        enhanced.insert(0, SystemMessage(content=block))
-    return enhanced
-
-
-def build_agent_graph(
-    llm, builtin_tools: list, tool_map: dict, middleware: SandboxMiddleware, cfg: Config
-):
-    """把 ReAct 循环构建成一张 LangGraph 状态图。
-
-    图的拓扑:
-
-        START → agent ──(有可执行工具调用)──▶ tools ──┐
-                  │                                   │
-                  └─(无工具调用 / 被拦截 / 取消 / 超步)──▶ END
-                  ▲                                   │
-                  └───────────────────────────────────┘
-
-    - ``agent`` 节点: 调用前由 middleware 依据沙箱实时状态注入工具(沙箱是否就绪决定
-      是否提供沙箱工具)与动态提示词,然后流式调用 LLM,产出文本增量、工具调用进度,
-      并做死循环检测、权限确认与工具调用过滤,决定下一步走向。
-    - ``tools`` 节点: 执行被放行的工具调用,回填 ``ToolMessage``,再回到 agent。
-
-    节点通过 ``_write`` 把过程信息写入 custom stream,由外层
-    ``stream_agent_response`` 翻译成前端既有的 SSE 事件,因此事件契约保持不变。
+    Agent 侧只看到业务参数(如 ``path`` / ``code``),``sandbox_id`` 不在 schema 里;
+    工具内部用 ``runtime`` 里的 thread_id 向沙箱池换取 adapter —— 映射由框架完成。
     """
 
-    async def call_model(state: AgentState) -> dict:
-        abort_event = state.get("abort_event")
-        if abort_event is not None and abort_event.is_set():
-            return {"status": "aborted"}
-
-        step = state.get("step", 0) + 1
-        max_steps = state.get("max_steps", 25)
-        if step > max_steps:
-            return {"status": "step_limit"}
-
-        _write({"kind": "step_start", "step": step, "max_steps": max_steps})
-
-        messages = list(state.get("messages") or [])
-        headroom = state.get("headroom")
-        if headroom:
-            messages = headroom.compress_messages(messages)
-
-        usage = dict(state.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
-        last_prompt_tokens = state.get("last_prompt_tokens", 0)
-        text_parts = list(state.get("text_parts") or [])
-
-        # ---- 流式调用 LLM,带上下文溢出压缩与可重试错误重试 ----
-        while True:
-            full_response = None
-            # middleware 依据沙箱实时状态注入工具集(沙箱未就绪时不提供沙箱工具)与动态提示词
-            llm_messages = await _with_sandbox_prompt(messages, middleware)
-            bound_llm = middleware.bind_llm(llm, builtin_tools)
-            try:
-                async for chunk in bound_llm.astream(llm_messages):
-                    if abort_event is not None and abort_event.is_set():
-                        return {"status": "aborted"}
-
-                    if chunk.content:
-                        if isinstance(chunk.content, str):
-                            text_parts.append(chunk.content)
-                        _write({"kind": "text_delta", "content": chunk.content})
-
-                    tool_call_chunks = getattr(chunk, "tool_call_chunks", None)
-                    if tool_call_chunks:
-                        for tc_chunk in tool_call_chunks:
-                            _write({"kind": "tool_call_progress", "chunk": tc_chunk})
-
-                    meta = getattr(chunk, "usage_metadata", None)
-                    if meta:
-                        usage["prompt_tokens"] += meta.get("input_tokens", 0)
-                        usage["completion_tokens"] += meta.get("output_tokens", 0)
-                        usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-                        last_prompt_tokens = meta.get("input_tokens", last_prompt_tokens)
-
-                    full_response = chunk if full_response is None else full_response + chunk
-                break
-            except Exception as e:
-                category = classify_error(e)
-                if category == ErrorCategory.CONTEXT_OVERFLOW:
-                    messages = emergency_compact(
-                        messages, cfg.headroom_config.get("emergency_keep_messages", 12)
-                    )
-                    _write({"kind": "error",
-                            "error": f"Context overflow, compressed messages, retrying step {step}"})
-                    continue
-                if category == ErrorCategory.RETRYABLE:
-                    try:
-                        full_response = await _llm_invoke_with_retry(bound_llm, llm_messages)
-                        break
-                    except Exception as retry_err:
-                        _write({"kind": "error", "error": str(retry_err)})
-                        return {"status": "error"}
-                _write({"kind": "error", "error": str(e)})
-                return {"status": "error"}
-
-        _write({"kind": "step_finish", "step": step})
-
-        if full_response is None:
-            _write({"kind": "error", "error": "Empty response from LLM"})
-            return {"status": "error"}
-
-        messages.append(full_response)
-        raw_tool_calls = list(getattr(full_response, "tool_calls", None) or [])
-        all_tool_calls = list(state.get("tool_calls") or [])
-        all_tool_calls.extend(raw_tool_calls)
-
-        call_history = list(state.get("call_history") or [])
-        update: dict = {
-            "messages": messages,
-            "step": step,
-            "usage": usage,
-            "last_prompt_tokens": last_prompt_tokens,
-            "text_parts": text_parts,
-            "tool_calls": all_tool_calls,
-            "call_history": call_history,
-            "allowed_tool_calls": [],
-            "status": "done",
-        }
-
-        if not raw_tool_calls:
-            return update
-
-        # ---- 死循环检测 + 权限确认,过滤出真正需要执行的工具调用 ----
-        permission_manager = current_permission_manager.get()
-        conversation_id = current_conversation_id.get()
-        threshold = state.get("doom_loop_threshold", 3)
-        allowed: list = []
-        dropped: list[ToolMessage] = []
-
-        for tc in raw_tool_calls:
-            name = tc.get("name", "")
-            args = tc.get("args", {}) or {}
-            tool_call_id = tc.get("id", "")
-
-            if _is_doom_loop(call_history, name, args, threshold):
-                _write({"kind": "doom_loop", "tool_name": name})
-                dropped.append(ToolMessage(
-                    content=f"Skipped: repeated identical call to '{name}' (doom loop detected).",
-                    tool_call_id=tool_call_id,
-                ))
-                continue
-
-            if permission_manager is not None and permission_manager.needs_confirmation(name, conversation_id):
-                _write({"kind": "confirm_request", "tool_call": tc})
-                approved = False
-                if tool_call_id:
-                    approved = await permission_manager.wait_for_confirmation(
-                        tool_call_id, timeout=cfg.agent_confirm_timeout
-                    )
-                if not approved:
-                    dropped.append(ToolMessage(
-                        content=f"User denied execution of tool '{name}'.",
-                        tool_call_id=tool_call_id,
-                    ))
-                    continue
-
-            allowed.append(tc)
-
-        if not allowed:
-            return update
-
-        # 被拦截的调用仍需回填 ToolMessage,保证 assistant.tool_calls 与结果一一对应
-        messages.extend(dropped)
-        update["allowed_tool_calls"] = allowed
-        update["status"] = "running"
-        return update
-
-    async def run_tools(state: AgentState) -> dict:
-        abort_event = state.get("abort_event")
-        messages = list(state.get("messages") or [])
-
-        for tc in state.get("allowed_tool_calls") or []:
-            if abort_event is not None and abort_event.is_set():
-                return {"status": "aborted"}
-
-            name = tc.get("name", "")
-            args = tc.get("args", {}) or {}
-            tool_call_id = tc.get("id", "")
-            tool = tool_map.get(name)
-
-            if tool is None:
-                content = f"Error: tool '{name}' is not available"
-            else:
-                try:
-                    result = await tool.ainvoke(args)
-                    content = result if isinstance(result, str) else str(result)
-                except Exception as e:
-                    content = f"Error in {name}: {e}"
-
-            tool_message = ToolMessage(content=content, tool_call_id=tool_call_id, name=name or None)
-            messages.append(tool_message)
-            _write({"kind": "tool_result", "message": tool_message})
-
-        return {"messages": messages, "allowed_tool_calls": [], "status": "running"}
-
-    def route_after_agent(state: AgentState) -> str:
-        if state.get("status") == "running" and state.get("allowed_tool_calls"):
-            return "tools"
-        return END
-
-    from langgraph.graph import END, StateGraph
-
-    graph = StateGraph(AgentState)
-    graph.add_node("agent", call_model)
-    graph.add_node("tools", run_tools)
-    graph.set_entry_point("agent")
-    graph.add_conditional_edges("agent", route_after_agent, {"tools": "tools", END: END})
-    graph.add_edge("tools", "agent")
-    return graph.compile()
-
-
-def create_claude_agent(sandbox_pool=None, skills=None, checkpointer=None, config=None) -> dict:
-    cfg = config or Config.get()
-
-    llm = _get_llm(cfg)
-
-    # 沙箱工具不在这里静态注册,而是交给 SandboxMiddleware,由它依据沙箱实时状态注入;
-    # 未启用沙箱(sandbox_pool 为空)时,不提供任何沙箱工具。
-    middleware = SandboxMiddleware(
-        sandbox_pool=sandbox_pool,
-        config=cfg,
-        sandbox_tool_factory=_create_sandbox_tools if sandbox_pool else None,
-    )
-
-    # 普通工具(本地 / Web / 技能)在创建期静态注册
-    builtin_tools: list[BaseTool] = []
-    tool_map: dict[str, Any] = {}
-
-    def _register(tool: BaseTool) -> None:
-        builtin_tools.append(tool)
-        tool_map[tool.name] = tool
-
-    for t in _create_local_tools():
-        _register(t)
-
-    for t in _create_lsp_tools():
-        _register(t)
-
-    for t in _create_web_tools():
-        _register(t)
-
-    if skills:
-        for skill in skills:
-            for tool in skill.get("tools", []):
-                _register(tool)
-
-    # 沙箱工具登记进执行映射(供 tools 节点执行),但只在沙箱就绪时才会提供给模型
-    sandbox_tools = middleware.sandbox_tools()
-    for t in sandbox_tools:
-        tool_map[t.name] = t
-
-    return {
-        "graph": build_agent_graph(llm, builtin_tools, tool_map, middleware, cfg),
-        "tool_map": tool_map,
-        "all_tools": builtin_tools + sandbox_tools,
-        "middleware": middleware,
-        "tool_kinds": {name: classify_tool(name).value for name in tool_map},
-    }
-
-
-def _make_sandbox_tool(tool_name: str, func: Any, tool_timeout: int = 60) -> BaseTool:
-    async def _run(**kwargs) -> str:
-        conv_id = current_conversation_id.get()
-        adapter = current_sandbox_adapter.get()
-        perm_mgr = current_permission_manager.get()
-
-        if perm_mgr:
-            check = perm_mgr.can_use(tool_name, conversation_id=conv_id, args=kwargs)
-            if not check.allowed:
-                return f"__PERMISSION_DENIED__:{check.reason}"
-
-        if adapter is None:
-            return "Error: No sandbox adapter available"
+    async def _run(runtime: ToolRuntime, **kwargs) -> str:
+        thread_id = _thread_id_from_runtime(runtime)
+        try:
+            adapter = await pool.get_or_create(thread_id)
+        except Exception as e:
+            return f"Error: sandbox unavailable ({e})"
 
         try:
             result = await asyncio.wait_for(
@@ -466,85 +136,126 @@ def _make_sandbox_tool(tool_name: str, func: Any, tool_timeout: int = 60) -> Bas
     )
 
 
+def _make_prepare_sandbox_tool(pool: Any) -> BaseTool:
+    """``prepare_sandbox`` —— 触发沙箱懒创建的基础设施工具。
+
+    该工具在沙箱未就绪时也必须对模型可见:动态提示词会引导 Agent 先调用它,
+    它内部按 thread_id 完成映射(未命中即创建),之后沙箱工具会在下一次模型调用时出现。
+    """
+
+    async def _run(runtime: ToolRuntime) -> str:
+        thread_id = _thread_id_from_runtime(runtime)
+        try:
+            await pool.get_or_create(thread_id)
+        except Exception as e:
+            return f"Error: failed to prepare sandbox: {e}"
+        return "Sandbox is ready. File system and code execution tools are now available."
+
+    return StructuredTool.from_function(
+        coroutine=_run,
+        name="prepare_sandbox",
+        description=(
+            "准备(懒创建)当前会话的沙箱环境。"
+            "适用场景: 系统提示词提示沙箱未就绪、而任务需要文件操作或代码执行时。"
+            "使用策略: 调用一次即可,沙箱就绪后文件系统与代码执行类工具会自动出现。"
+        ),
+    )
+
+
+def _create_sandbox_tools(pool: Any) -> list[BaseTool]:
+    if pool is None:
+        return []
+    timeouts = {
+        "read_file": 10,
+        "write_file": 10,
+        "list_files": 10,
+        "execute_code": 120,
+        "execute_command": 120,
+        "glob_files": 10,
+        "grep_files": 30,
+        "edit_file": 10,
+        "apply_patch": 10,
+        "web_fetch": 30,
+        "search_files": 30,
+        "make_directory": 5,
+    }
+    tools = [_make_prepare_sandbox_tool(pool)]
+    tools.extend(
+        _make_sandbox_tool(pool, name, timeouts.get(name, 60))
+        for name in SANDBOX_TOOL_DESCRIPTIONS
+    )
+    return tools
+
+
 SANDBOX_TOOL_DESCRIPTIONS = {
     "read_file": (
-        "读取沙箱中指定文件的内容。"
+        "读取沙箱中指定文件的内容(分片读取,单次最多 100 行)。"
         "参数: path(文件路径), start_line(起始行,默认1), length(读取行数,默认100)。"
-        "使用策略: 找到所需信息后应立即停止读取,不要为了'读完'而继续。"
-        "与其他工具的关系: 需要搜索文件内容时用grep_files更高效。"
+        "适用场景: 已经定位到大致位置,需要精读上下文时。"
+        "使用策略: 按需读取,命中目标后立即停止,不要为了'读完'而继续。"
+        "与其他工具的关系: 全局检索关键词用 grep_files(更快、更省上下文);"
+        "统计/聚合/计算用 execute_code(精确,不产生数值幻觉)。"
     ),
     "write_file": (
         "将内容写入沙箱中的文件。"
-        "参数: path(文件路径), content(文件内容)。"
-        "适用场景: 创建新文件或完全覆盖现有文件内容。"
+        "参数: path(文件路径), content(完整文件内容)。"
+        "适用场景: 创建新文件,或需要完全覆盖现有文件内容时。"
+        "与其他工具的关系: 只改局部内容用 edit_file(精确替换),避免整文件重写。"
     ),
     "list_files": (
         "列出指定目录下的文件和子目录。"
         "参数: path(目录路径), pattern(可选,文件名匹配模式)。"
+        "适用场景: 需要先了解工作区结构时的第一选择。"
     ),
     "execute_code": (
-        "在沙箱中执行Python代码。"
-        "参数: code(Python代码字符串)。"
+        "在沙箱中执行 Python 代码。"
+        "参数: code(Python 代码字符串), language(默认 python)。"
         "适用场景: 数值计算、数据处理、生成图表等需要精确计算的任务。"
-        "注意: 沙箱预装了numpy/pandas/matplotlib等库。"
+        "使用策略: 能用代码算的不要让模型去'估'(避免数值幻觉)。"
+        "注意: 沙箱预装了 numpy/pandas/matplotlib 等库。"
     ),
     "execute_command": (
-        "在沙箱中执行Shell命令。"
-        "参数: command(Shell命令字符串)。"
+        "在沙箱中执行 Shell 命令。"
+        "参数: command(Shell 命令字符串)。"
+        "使用策略: 优先用专用工具(read_file/grep_files/execute_code),仅在必要时才用 shell。"
         "注意: 此工具需要用户确认。"
     ),
     "glob_files": (
-        "使用glob模式搜索文件。"
-        "参数: pattern(glob模式), path(搜索起始路径)。"
+        "使用 glob 模式按文件名搜索文件。"
+        "参数: pattern(glob 模式,如 **/*.py), path(搜索起始路径)。"
+        "与其他工具的关系: 按'文件名'找用 glob_files;按'内容'找用 grep_files。"
     ),
     "grep_files": (
-        "在文件中搜索文本模式。"
+        "在文件内容中按模式检索,返回命中位置与行号。"
         "参数: pattern(搜索模式), path(搜索路径), file_pattern(文件匹配模式)。"
-        "使用策略: 上限100个匹配,够用即可。"
+        "适用场景: 还不确定信息在文件哪一部分时的第一选择。"
+        "使用策略: 上限 100 个匹配,够用即可;定位后再用 read_file 精读。"
     ),
     "edit_file": (
-        "编辑沙箱中的文件。"
-        "参数: path(文件路径), old_text(要替换的文本), new_text(新文本)。"
-        "策略: 精确匹配失败时自动尝试9种模糊策略。"
+        "编辑沙箱中的文件(精确文本替换)。"
+        "参数: path(文件路径), old_text(要被替换的原文本), new_text(替换后的新文本)。"
+        "使用策略: 精确匹配失败时自动尝试 9 种模糊策略。"
     ),
     "apply_patch": (
-        "应用unified diff格式的补丁到文件。"
-        "参数: path(文件路径), diff(unified diff内容)。"
+        "应用 unified diff 格式的补丁到文件。"
+        "参数: path(文件路径), diff(unified diff 内容)。"
+        "适用场景: 一次性做多处结构化修改时,比多次 edit_file 更可靠。"
     ),
     "web_fetch": (
-        "获取指定URL的网页内容。"
+        "获取指定 URL 的网页内容。"
         "参数: url(URL)。"
-        "安全: 自动拒绝内网IP,防止SSRF。"
+        "安全: 自动拒绝内网 IP,防止 SSRF。此工具需要用户确认。"
     ),
     "search_files": (
         "在沙箱文件系统中搜索内容。"
         "参数: query(搜索关键词), path(搜索路径)。"
+        "与其他工具的关系: 需要正则/文件名过滤时用 grep_files 更精确。"
     ),
     "make_directory": (
         "在沙箱中创建目录。"
         "参数: path(目录路径)。"
     ),
 }
-
-
-class ToolKind(str, Enum):
-    """工具类型。
-
-    - ``SANDBOX``: 沙箱工具,必须在沙箱中就绪才能执行,由 SandboxMiddleware 依据
-      沙箱实时状态动态注入;
-    - ``BUILTIN``: 普通工具(本地/Web/技能),在创建 Agent 时静态注册。
-    """
-
-    SANDBOX = "sandbox"
-    BUILTIN = "builtin"
-
-
-SANDBOX_TOOL_NAMES: frozenset[str] = frozenset(SANDBOX_TOOL_DESCRIPTIONS)
-
-
-def classify_tool(name: str) -> ToolKind:
-    """判断一个工具名属于沙箱工具还是普通工具。"""
-    return ToolKind.SANDBOX if name in SANDBOX_TOOL_NAMES else ToolKind.BUILTIN
 
 
 class ReadFileArgs(BaseModel):
@@ -623,24 +334,9 @@ SANDBOX_TOOL_SCHEMAS: dict[str, type[BaseModel]] = {
 }
 
 
-def _create_sandbox_tools() -> list[BaseTool]:
-    tool_names = list(SANDBOX_TOOL_DESCRIPTIONS.keys())
-    timeouts = {
-        "read_file": 10,
-        "write_file": 10,
-        "list_files": 10,
-        "execute_code": 120,
-        "execute_command": 120,
-        "glob_files": 10,
-        "grep_files": 30,
-        "edit_file": 10,
-        "apply_patch": 10,
-        "web_fetch": 30,
-        "search_files": 30,
-        "make_directory": 5,
-    }
-    return [_make_sandbox_tool(name, None, timeouts.get(name, 60)) for name in tool_names]
-
+# ---------------------------------------------------------------------------
+# 普通工具(本地 / LSP / Web / 技能):创建期静态注册
+# ---------------------------------------------------------------------------
 
 def _create_local_tools() -> list[BaseTool]:
     from datetime import datetime
@@ -719,8 +415,61 @@ def _create_web_tools() -> list[BaseTool]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Agent 装配:create_agent + 可插拔 Middleware 栈
+# ---------------------------------------------------------------------------
+
+def create_claude_agent(sandbox_pool=None, skills=None, checkpointer=None, config=None) -> dict:
+    """按项目二的「可插拔组合」方式装配 Agent。
+
+    - 普通工具在创建期静态注册;
+    - 沙箱工具同样进入工具列表(供 ToolNode 执行),但是否对模型可见由
+      :class:`SandboxMiddleware` 在每次模型调用前依据沙箱实时状态决定;
+    - 沙箱实现(远端 / 本地)对 Agent 透明,只通过 ``sandbox_pool`` 注入。
+    """
+    cfg = config or Config.get()
+
+    llm = _get_llm(cfg)
+
+    builtin_tools: list[BaseTool] = []
+    builtin_tools.extend(_create_local_tools())
+    builtin_tools.extend(_create_lsp_tools())
+    builtin_tools.extend(_create_web_tools())
+
+    if skills:
+        for skill in skills:
+            for tool in skill.get("tools", []):
+                builtin_tools.append(tool)
+
+    sandbox_tools = _create_sandbox_tools(sandbox_pool)
+
+    sandbox_middleware, stack = build_middleware_stack(
+        sandbox_pool=sandbox_pool,
+        config=cfg,
+        headroom=HeadroomService.get_instance(),
+    )
+    sandbox_middleware.set_sandbox_tools(sandbox_tools)
+
+    agent = create_agent(
+        llm,
+        tools=builtin_tools + sandbox_tools,
+        middleware=stack,
+        checkpointer=checkpointer,
+    )
+
+    return {
+        "graph": agent,
+        "middleware": sandbox_middleware,
+        "all_tools": builtin_tools + sandbox_tools,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 流式翻译:图内 custom 事件 + 模型流式增量 → 既有 SSE 事件契约
+# ---------------------------------------------------------------------------
+
 async def _translate_event(event: dict, callbacks: dict) -> AsyncGenerator:
-    """把图内写的 custom 事件翻译成一次回调调用,并透传回调产出的 SSE 字符串。"""
+    """把一个 custom 事件翻译成一次回调调用,并透传回调产出的 SSE 字符串。"""
     kind = event.get("kind")
     handler = callbacks.get(kind)
     if handler is None:
@@ -752,9 +501,7 @@ async def _translate_event(event: dict, callbacks: dict) -> AsyncGenerator:
 async def stream_agent_response(
     graph,
     messages: list[BaseMessage],
-    max_steps: int = 25,
-    doom_loop_threshold: int = 3,
-    headroom: HeadroomService | None = None,
+    thread_id: str = "",
     abort_event: asyncio.Event | None = None,
     on_step_start=None,
     on_text_delta=None,
@@ -765,12 +512,12 @@ async def stream_agent_response(
     on_doom_loop=None,
     on_confirm_request=None,
 ):
-    """驱动 LangGraph Agent 图,把图内的 custom 事件翻译为既有 SSE 事件流。
+    """驱动 ``create_agent`` 编译出的图,把过程信号翻译成既有 SSE 事件流。
 
-    与旧实现相比:
-    - 不再手写 ReAct while 循环,循环控制完全交给图的节点与条件边;
-    - 通过 ``stream_mode=["custom", "values"]`` 同时拿到实时事件与最终状态;
-    - 每次请求的 max_steps / abort_event / headroom 作为初始状态注入,图实例可复用。
+    与旧的手写 ReAct 图相比:
+    - 循环控制 / 工具执行完全交给框架,这里只做「事件翻译」;
+    - ``stream_mode=["custom","messages","values"]`` 分别取横切事件、模型流式增量与最终状态;
+    - ``thread_id`` 通过 config 注入,框架据此在工具内部完成 ``thread_id → sandbox_id`` 映射。
     """
     callbacks = {
         "step_start": on_step_start,
@@ -783,35 +530,59 @@ async def stream_agent_response(
         "confirm_request": on_confirm_request,
     }
 
-    initial: AgentState = {
-        "messages": list(messages),
-        "step": 0,
-        "max_steps": max_steps,
-        "doom_loop_threshold": doom_loop_threshold,
-        "headroom": headroom,
-        "abort_event": abort_event,
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        "last_prompt_tokens": 0,
-        "text_parts": [],
-        "tool_calls": [],
-        "allowed_tool_calls": [],
-        "call_history": [],
-        "status": "running",
-    }
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    last_prompt_tokens = 0
+    full_text_parts: list[str] = []
+    tool_calls: list = []
+    step_limit = False
 
-    final_state: dict = initial
     try:
-        async for item in graph.astream(initial, stream_mode=["custom", "values"]):
-            if isinstance(item, tuple) and len(item) == 2:
-                _, chunk = item
-            else:
-                chunk = item
+        async for item in graph.astream(
+            {"messages": list(messages)},
+            stream_mode=["custom", "messages", "values"],
+            config={"configurable": {"thread_id": thread_id or ""}},
+        ):
+            mode, payload = item if isinstance(item, tuple) and len(item) == 2 else ("values", item)
 
-            if isinstance(chunk, dict) and "kind" in chunk:
-                async for sse in _translate_event(chunk, callbacks):
-                    yield sse
-            elif isinstance(chunk, dict):
-                final_state = chunk
+            if mode == "custom":
+                if isinstance(payload, dict) and "kind" in payload:
+                    if payload["kind"] == "step_limit":
+                        step_limit = True
+                    async for sse in _translate_event(payload, callbacks):
+                        yield sse
+
+            elif mode == "messages":
+                chunk, _meta = payload
+                if isinstance(chunk, AIMessageChunk):
+                    content = getattr(chunk, "content", None)
+                    if content:
+                        if isinstance(content, str):
+                            full_text_parts.append(content)
+                        async for sse in _translate_event(
+                            {"kind": "text_delta", "content": content}, callbacks
+                        ):
+                            yield sse
+
+                    for tc_chunk in (getattr(chunk, "tool_call_chunks", None) or []):
+                        async for sse in _translate_event(
+                            {"kind": "tool_call_progress", "chunk": tc_chunk}, callbacks
+                        ):
+                            yield sse
+
+                    meta = getattr(chunk, "usage_metadata", None)
+                    if meta:
+                        usage["prompt_tokens"] += meta.get("input_tokens", 0) or 0
+                        usage["completion_tokens"] += meta.get("output_tokens", 0) or 0
+                        usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+                        last_prompt_tokens = meta.get("input_tokens", last_prompt_tokens) or last_prompt_tokens
+
+            elif mode == "values":
+                state_messages = payload.get("messages") if isinstance(payload, dict) else None
+                if state_messages:
+                    tool_calls = []
+                    for m in state_messages:
+                        for tc in (getattr(m, "tool_calls", None) or []):
+                            tool_calls.append(tc)
 
             if abort_event is not None and abort_event.is_set():
                 break
@@ -820,18 +591,7 @@ async def stream_agent_response(
             yield await on_error(str(e))
         return
 
-    usage = final_state.get("usage") or {}
-    last_prompt_tokens = final_state.get("last_prompt_tokens", 0)
-    status = final_state.get("status", "done")
-
-    if status == "aborted" or (abort_event is not None and abort_event.is_set()):
-        yield {"type": "aborted"}
-        return
-
-    if status == "error":
-        return
-
-    if status == "step_limit":
+    if step_limit:
         yield {
             "type": "step_limit_reached",
             "usage": usage,
@@ -840,12 +600,16 @@ async def stream_agent_response(
         }
         return
 
+    if abort_event is not None and abort_event.is_set():
+        yield {"type": "aborted"}
+        return
+
     yield {
         "type": "done",
         "usage": usage,
         "cumulative_usage": usage,
         "context_tokens": last_prompt_tokens,
         "compression_pending": last_prompt_tokens > 128000 * 0.7,
-        "full_text": "".join(final_state.get("text_parts") or []),
-        "tool_calls": final_state.get("tool_calls") or [],
+        "full_text": "".join(full_text_parts),
+        "tool_calls": tool_calls,
     }

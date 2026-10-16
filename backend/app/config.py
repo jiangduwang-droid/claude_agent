@@ -32,6 +32,10 @@ DEFAULT_CONFIG: dict = {
         "idle_timeout": 1800,
         "sweep_interval": 60,
         "max_health_errors": 3,
+        "session_key_prefix": "sandbox:session",
+    },
+    "redis": {
+        "url": "",
     },
     "agent": {
         "max_steps": 25,
@@ -158,6 +162,8 @@ class Config:
             env_overrides.setdefault("llm", {}).setdefault("api_keys", {})["openai"] = openai_key
         if dashscope_key := os.environ.get("DASHSCOPE_API_KEY"):
             env_overrides.setdefault("llm", {}).setdefault("api_keys", {})["dashscope"] = dashscope_key
+        if redis_url := os.environ.get("REDIS_URL"):
+            env_overrides.setdefault("redis", {})["url"] = redis_url
 
         self._data = _deep_merge(merged, env_overrides)
         self._data["auth"]["jwt_secret"] = _get_jwt_secret(self._data)
@@ -263,6 +269,14 @@ class Config:
     @property
     def sandbox_max_health_errors(self) -> int:
         return self._data["sandbox"]["max_health_errors"]
+
+    @property
+    def sandbox_session_key_prefix(self) -> str:
+        return self._data["sandbox"].get("session_key_prefix", "sandbox:session")
+
+    @property
+    def redis_url(self) -> str:
+        return self._data.get("redis", {}).get("url", "")
 
     @property
     def agent_lock_timeout(self) -> int:

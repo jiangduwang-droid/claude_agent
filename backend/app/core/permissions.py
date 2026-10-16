@@ -8,9 +8,9 @@ from pathlib import Path
 READ_PROFILE = {
     "name": "read",
     "allow": [
-        "read_file", "search_files", "glob_files", "grep_files",
+        "read_file", "search_files", "glob_files", "grep_files", "list_files",
         "lsp_hover", "lsp_references", "lsp_diagnostics", "lsp_symbols",
-        "web_search", "get_current_time", "check_syntax",
+        "web_search", "get_current_time", "check_syntax", "prepare_sandbox",
     ],
     "deny": ["execute_code", "execute_command", "web_fetch", "edit_file", "apply_patch", "write_file", "make_directory"],
     "confirm_before": [],

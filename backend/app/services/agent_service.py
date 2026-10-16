@@ -14,10 +14,9 @@ from langchain_core.messages import (
 from app.config import Config
 from app.core.agent import (
     create_claude_agent, stream_agent_response,
-    current_conversation_id, current_sandbox_adapter, current_permission_manager
+    current_conversation_id, current_permission_manager
 )
 from app.core.event_bus import event_bus, EventType
-from app.core.headroom_service import HeadroomService
 from app.core.permissions import PermissionManager
 from app.core.prompts.system import build_system_prompt
 from app.models.models import Conversation, Message, User
@@ -38,7 +37,6 @@ class AgentService:
 
     def __init__(self):
         self._config = Config.get()
-        self._headroom = HeadroomService.get_instance()
         self._locks: dict[str, asyncio.Lock] = {}
         self._agent_locks: dict[str, asyncio.Lock] = {}
 
@@ -215,6 +213,32 @@ class AgentService:
             session.add(assistant_msg)
             await session.commit()
 
+    async def _sync_sandbox_id(self, engine, conversation_id: str, sandbox_pool) -> None:
+        """流结束后把懒创建出来的 sandbox_id 回写数据库。
+
+        沙箱是 Agent 调用 prepare_sandbox 时按 thread_id 懒创建的,所以这里只读取映射
+        结果用于展示与删除清理,不在请求开始时急切创建沙箱。
+        """
+        if sandbox_pool is None:
+            return
+        try:
+            sandbox_id = sandbox_pool.store.get(conversation_id)
+        except Exception:
+            return
+        if not sandbox_id:
+            return
+        try:
+            async with AsyncSession(engine, expire_on_commit=False) as session:
+                result = await session.execute(
+                    select(Conversation).where(Conversation.id == uuid.UUID(conversation_id))
+                )
+                conv = result.scalar_one_or_none()
+                if conv is not None and conv.sandbox_id != sandbox_id:
+                    conv.sandbox_id = sandbox_id
+                    await session.commit()
+        except Exception as e:
+            print(f"[AgentService] Sandbox id sync failed: {e}")
+
     async def invoke_stream(
         self,
         engine,
@@ -247,25 +271,9 @@ class AgentService:
                 engine, conversation_id, user_id, content, attachments
             )
 
-            sandbox_adapter = None
-            if sandbox_pool:
-                try:
-                    sandbox_adapter = await sandbox_pool.get_or_create(conversation_id)
-                    async with AsyncSession(engine, expire_on_commit=False) as session:
-                        result = await session.execute(
-                            select(Conversation).where(
-                                Conversation.id == uuid.UUID(conversation_id)
-                            )
-                        )
-                        conv = result.scalar_one_or_none()
-                        if conv:
-                            conv.sandbox_id = sandbox_adapter.sandbox_id
-                            await session.commit()
-                except Exception as e:
-                    print(f"[AgentService] Sandbox allocation failed: {e}")
-                    yield _sse_event("error", error=f"Sandbox unavailable: {e}")
-
-            token_adapter = current_sandbox_adapter.set(sandbox_adapter)
+            # 沙箱不再在这里急切创建(对齐项目二): 映射未命中时由 SandboxMiddleware
+            # 在模型调用前注入「未就绪」提示词,引导 Agent 调用 prepare_sandbox 触发懒创建。
+            # 这里只需把 thread_id(= conversation_id)交给框架,映射由工具内部完成。
 
             skill_prompts = ""
             if skills_registry:
@@ -290,17 +298,15 @@ class AgentService:
             async for event in stream_agent_response(
                 agent_components["graph"],
                 messages,
-                max_steps=self._config.max_steps,
-                doom_loop_threshold=self._config.doom_loop_threshold,
-                headroom=self._headroom,
+                thread_id=conversation_id,
                 abort_event=abort_event,
                 on_step_start=lambda step, max_s: _async_sse("start_step", step=step, max_steps=max_s),
                 on_text_delta=lambda delta: _async_sse("text_delta", content=delta),
                 on_tool_call_progress=lambda chunk: _async_sse(
                     "tool_call_progress",
-                    tool_name=chunk.get("name", ""),
-                    tool_id=chunk.get("id", ""),
-                    args=chunk.get("args", {}),
+                    tool_name=_chunk_field(chunk, "name"),
+                    tool_id=_chunk_field(chunk, "id"),
+                    args=_chunk_field(chunk, "args", {}),
                 ),
                 on_tool_result=lambda tm: _async_sse(
                     "tool_result",
@@ -349,9 +355,9 @@ class AgentService:
                 engine, conversation_id, full_response_text, all_tool_calls, None
             )
 
-            await event_bus.emit(EventType.STREAM_COMPLETED, conversation_id=conversation_id)
+            await self._sync_sandbox_id(engine, conversation_id, sandbox_pool)
 
-            current_sandbox_adapter.reset(token_adapter)
+            await event_bus.emit(EventType.STREAM_COMPLETED, conversation_id=conversation_id)
 
         except Exception as e:
             print(f"[AgentService] Stream error: {e}")
@@ -369,6 +375,13 @@ class AgentService:
         event = self._abort_events.get(conversation_id)
         if event:
             event.set()
+
+
+def _chunk_field(chunk, key: str, default=""):
+    """工具调用增量既可能是 dict,也可能是 ToolCallChunk 对象,统一取值。"""
+    if isinstance(chunk, dict):
+        return chunk.get(key, default)
+    return getattr(chunk, key, default) or default
 
 
 def _sse_event(event_type: str, **kwargs) -> str:

@@ -78,8 +78,9 @@ SANDBOX_READY_TEMPLATE = """## 沙箱环境(实时状态)
 - 当前可用沙箱工具: {tools}"""
 
 SANDBOX_UNAVAILABLE_TEMPLATE = """## 沙箱环境(实时状态)
-- 状态: 暂不可用
-- 当前无法执行文件操作与代码执行;如需这些能力请提示用户稍后重试。"""
+- 状态: 未就绪
+- 当前没有可用的沙箱环境。若任务需要文件操作或代码执行,请先调用 prepare_sandbox
+  准备环境;沙箱就绪后文件系统与代码执行类工具会自动出现。"""
 
 
 def build_sandbox_prompt(
@@ -91,7 +92,7 @@ def build_sandbox_prompt(
 ) -> str:
     """根据沙箱的实时状态生成动态提示词片段。
 
-    - 沙箱未就绪时: 只给出"不可用"的简短说明;
+    - 沙箱未就绪时: 提示 Agent 先调用 ``prepare_sandbox`` 触发懒创建;
     - 沙箱就绪时: 给出工作目录、预装库、当前可用沙箱工具,以及最新的工作区文件列表。
     """
     if not ready:
